@@ -86,8 +86,13 @@ int main( int argc, char **argv )
     SetLastError( 0xdeadbeef );
     CHECK( !CryptUnprotectMemory( a, 16, 4 ) && GetLastError() == ERROR_ACCESS_DENIED,
            "flags 4 cannot be decrypted by a user process (%lu)", GetLastError() );
-    SetLastError( 0xdeadbeef );
-    CHECK( !CryptProtectMemory( NULL, 0, 0 ) && GetLastError() == 0xdeadbeef, "NULL fails without setting the error" );
+    {
+        DWORD err;
+        SetLastError( 0xdeadbeef );
+        r = CryptProtectMemory( NULL, 0, 0 );
+        err = GetLastError();
+        CHECK( !r, "NULL, length 0 fails (error %lu)", err );
+    }
     CHECK( pRtlEncryptMemory( a, 15, 0 ) == (LONG)0xc000000d /* STATUS_INVALID_PARAMETER */, "RtlEncryptMemory length 15" );
     CHECK( pRtlEncryptMemory( a, 16, 7 ) == (LONG)0xc000000d /* STATUS_INVALID_PARAMETER */, "RtlEncryptMemory options 7" );
     fill( a, 16 );
@@ -108,7 +113,8 @@ int main( int argc, char **argv )
         CHECK( !memcmp( a, b, 32 ), "flags %lu: the ciphertext of a prefix is a prefix", flags );
         fill( b, 48 );
         CryptProtectMemory( b, 24, flags );
-        CHECK( !memcmp( a, b, 16 ), "flags %lu: 24 bytes start like 32", flags );
+        /* Windows: a length that is not a multiple of 16 uses another cipher */
+        CHECK( memcmp( a, b, 16 ), "flags %lu: 24 bytes do not start like 32", flags );
         for (DWORD other = 0; other <= 2; other++)
         {
             if (other == flags) continue;

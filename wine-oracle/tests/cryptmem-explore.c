@@ -5,6 +5,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _MSC_VER
+#define GUARD(what, call) __try { call; } __except (EXCEPTION_EXECUTE_HANDLER) { \
+    printf( "%-34s EXCEPTION %08lx\n", what, GetExceptionCode() ); }
+#else
+#define GUARD(what, call) do { call; } while (0)
+#endif
+
 typedef LONG (WINAPI *rtl_crypt_fn)( void *, ULONG, ULONG );
 static rtl_crypt_fn pRtlEncryptMemory, pRtlDecryptMemory;
 
@@ -65,8 +72,19 @@ int main( int argc, char **argv )
             printf( "  unprotect: %d err %lu, %s\n", r, r ? 0 : GetLastError(), a[0] == 0x40 && a[15] == 0x4f ? "round trip" : "DIFFERENT" );
         }
     }
-    SetLastError( 0xdeadbeef );
-    printf( "protect NULL len 0: %d err %lu\n", CryptProtectMemory( NULL, 0, 0 ), GetLastError() );
+    /* (the arguments of printf are evaluated in no given order: read the error first) */
+    {
+        BOOL r; DWORD err;
+        SetLastError( 0xdeadbeef );
+        r = CryptProtectMemory( NULL, 0, 0 ); err = GetLastError();
+        printf( "protect NULL len 0: %d err %lu\n", r, err );
+        SetLastError( 0xdeadbeef );
+        GUARD( "protect NULL len 16", r = CryptProtectMemory( NULL, 16, 0 ); err = GetLastError();
+               printf( "protect NULL len 16: %d err %lu\n", r, err ) );
+        SetLastError( 0xdeadbeef );
+        GUARD( "unprotect NULL len 16", r = CryptUnprotectMemory( NULL, 16, 0 ); err = GetLastError();
+               printf( "unprotect NULL len 16: %d err %lu\n", r, err ) );
+    }
     if (pRtlEncryptMemory)
     {
         fill( a, 16 );
