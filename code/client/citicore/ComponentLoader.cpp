@@ -188,8 +188,9 @@ void ComponentLoader::InitializeWithString(std::string_view cacheBuf)
 						environmentType = L"Windows on ARM";
 					}
 
-					trace("The game is running in insecure mode because %s is not supported by the anti-cheat components at this time.\n",
-						ToNarrow(environmentType));
+					// not trace(): this runs during CoreRT initialization, before its console exists
+					OutputDebugStringW(va(L"The game is running in insecure mode because %s is not supported by the anti-cheat components at this time.\n",
+						environmentType));
 
 					// Only show the (blocking) notice once per installation, it would otherwise stop every launch.
 					const std::wstring iniPath = MakeRelativeCitPath(L"CitizenFX.ini");
