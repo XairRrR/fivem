@@ -36,7 +36,7 @@ jobs:
           foreach ($t in Get-ChildItem wine-oracle/tests/*.c) {
             $exe = Join-Path $out ($t.BaseName + '.exe')
             $obj = Join-Path $out ($t.BaseName + '.obj')
-            cl /nologo /W3 /Fe:$exe /Fo:$obj $t.FullName user32.lib crypt32.lib advapi32.lib shell32.lib ole32.lib avrt.lib
+            cl /nologo /W3 /Fe:$exe /Fo:$obj $t.FullName user32.lib crypt32.lib advapi32.lib shell32.lib ole32.lib avrt.lib wtsapi32.lib
             if ($LASTEXITCODE -ne 0) { $rows += "| $($t.BaseName) | build failed |"; $failed++; continue }
             $log = & $exe 2>&1 | Out-String
             Set-Content -Path (Join-Path $out ($t.BaseName + '.txt')) -Value $log
