@@ -19,6 +19,20 @@ static void show( const char *what, HANDLE h, DWORD index )
             h ? 0 : err, index, GetThreadPriority( GetCurrentThread() ) );
 }
 
+static DWORD join_index;
+
+static DWORD WINAPI joiner( void *arg )
+{
+    DWORD idx = join_index;
+    HANDLE h;
+
+    SetLastError( 0xdeadbeef );
+    h = AvSetMmThreadCharacteristicsA( "Playback", &idx );
+    show( "index: other thread joins (Playback)", h, idx );
+    if (h) AvRevertMmThreadCharacteristics( h );
+    return 0;
+}
+
 static DWORD WINAPI worker( void *arg )
 {
     DWORD index = 0;
@@ -122,7 +136,15 @@ static DWORD WINAPI worker( void *arg )
         SetLastError( 0xdeadbeef );
         a = AvSetMmMaxThreadCharacteristicsA( "Audio", "Pro Audio", &idx );
         show( "index: max with 0", a, idx );
-        if (a) AvRevertMmThreadCharacteristics( a );
+        if (a)
+        {
+            HANDLE t;
+            join_index = idx;
+            t = CreateThread( NULL, 0, joiner, NULL, 0, NULL );
+            WaitForSingleObject( t, INFINITE );
+            CloseHandle( t );
+            AvRevertMmThreadCharacteristics( a );
+        }
     }
     printf( "end thread priority %d\n", GetThreadPriority( GetCurrentThread() ) );
     return 0;

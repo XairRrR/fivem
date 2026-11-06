@@ -69,6 +69,22 @@ static int raised(void)
     return nice == 1000 ? GetThreadPriority( GetCurrentThread() ) > 0 : nice < 0;
 }
 
+static DWORD shared_index;
+
+/* a second thread joining the task of the first one with its index */
+static DWORD WINAPI joiner( void *arg )
+{
+    DWORD index = shared_index;
+    HANDLE h;
+
+    SetLastError( 0xdeadbeef );
+    h = AvSetMmThreadCharacteristicsA( "Audio", &index );
+    CHECK( h != NULL && index == shared_index, "another thread joins the active task %lu (handle %p, err %lu, index %lu)",
+           shared_index, h, h ? 0 : GetLastError(), index );
+    if (h) AvRevertMmThreadCharacteristics( h );
+    return 0;
+}
+
 static DWORD WINAPI worker( void *arg )
 {
     DWORD index = 0, index2 = 0;
@@ -117,9 +133,38 @@ static DWORD WINAPI worker( void *arg )
     SetLastError( 0xdeadbeef );
     CHECK( !AvQuerySystemResponsiveness( NULL, &resp ) && GetLastError() == ERROR_INVALID_HANDLE, "responsiveness NULL" );
 
+    /* TaskIndex is in/out: a stale or unknown index fails and is left untouched */
+    {
+        DWORD stale = index2, idx = stale;
+        SetLastError( 0xdeadbeef );
+        h = AvSetMmThreadCharacteristicsA( "Audio", &idx );
+        CHECK( !h && GetLastError() == ERROR_INVALID_TASK_INDEX && idx == stale,
+               "the index of a reverted task fails with ERROR_INVALID_TASK_INDEX (%lu, index %lu)", GetLastError(), idx );
+        idx = 12345;
+        SetLastError( 0xdeadbeef );
+        h = AvSetMmThreadCharacteristicsA( "Audio", &idx );
+        CHECK( !h && GetLastError() == ERROR_INVALID_TASK_INDEX && idx == 12345,
+               "an unknown index fails with ERROR_INVALID_TASK_INDEX (%lu, index %lu)", GetLastError(), idx );
+        idx = stale;
+        SetLastError( 0xdeadbeef );
+        h = AvSetMmMaxThreadCharacteristicsA( "Audio", "Pro Audio", &idx );
+        CHECK( !h && GetLastError() == ERROR_INVALID_TASK_INDEX,
+               "max with the index of a reverted task fails with ERROR_INVALID_TASK_INDEX (%lu)", GetLastError() );
+    }
+
+    index = 0;
     h = AvSetMmMaxThreadCharacteristicsA( "Audio", "Pro Audio", &index );
-    CHECK( h != NULL, "AvSetMmMaxThreadCharacteristics(Audio, Pro Audio)" );
-    if (h) AvRevertMmThreadCharacteristics( h );
+    CHECK( h != NULL && index > index2, "AvSetMmMaxThreadCharacteristics(Audio, Pro Audio) (index %lu)", index );
+    if (h)
+    {
+        HANDLE t;
+        shared_index = index;
+        t = CreateThread( NULL, 0, joiner, NULL, 0, NULL );
+        WaitForSingleObject( t, INFINITE );
+        CloseHandle( t );
+        AvRevertMmThreadCharacteristics( h );
+    }
+    index = 0;
     SetLastError( 0xdeadbeef );
     h = AvSetMmMaxThreadCharacteristicsA( "Audio", NULL, &index );
     CHECK( !h && GetLastError() == ERROR_INVALID_TASK_INDEX,
