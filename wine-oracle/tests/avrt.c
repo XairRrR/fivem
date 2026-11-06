@@ -63,6 +63,60 @@ static int linux_nice(void)
     return best;
 }
 
+/* Lowest nice the process may set itself, from "Max nice priority" in /proc/<pid>/limits */
+static int own_proc_dir( char *dir, int size )
+{
+    char exe[MAX_PATH], *name, comm[64], path[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE find;
+    int found = 0;
+
+    GetModuleFileNameA( NULL, exe, sizeof(exe) );
+    name = strrchr( exe, '\\' ) ? strrchr( exe, '\\' ) + 1 : exe;
+    if ((find = FindFirstFileA( "Z:\\proc\\*", &fd )) == INVALID_HANDLE_VALUE) return 0;
+    do
+    {
+        if (fd.cFileName[0] < '1' || fd.cFileName[0] > '9') continue;
+        snprintf( path, sizeof(path), "Z:\\proc\\%s\\stat", fd.cFileName );
+        comm[0] = 0;
+        read_stat_field( path, 3, comm, sizeof(comm) );
+        if (strncmp( comm, name, 15 )) continue;
+        snprintf( dir, size, "Z:\\proc\\%s", fd.cFileName );
+        found = 1;
+    } while (!found && FindNextFileA( find, &fd ));
+    FindClose( find );
+    return found;
+}
+
+/* On Linux the priority can only be raised with rtkit (system bus) or a RLIMIT_NICE above 20:
+ * a CI container has neither, and the priority checks are skipped there. */
+static int host_can_raise(void)
+{
+    char dir[MAX_PATH], path[MAX_PATH], line[256];
+    FILE *f;
+    int ok = 0;
+
+    {
+        /* (GetFileAttributes does not see a Unix socket, the directory listing does) */
+        WIN32_FIND_DATAA fd;
+        HANDLE find = FindFirstFileA( "Z:\\run\\dbus\\system_bus_socket", &fd );
+        if (find != INVALID_HANDLE_VALUE)
+        {
+            FindClose( find );
+            return 1;
+        }
+    }
+    if (!own_proc_dir( dir, sizeof(dir) )) return 0;
+    snprintf( path, sizeof(path), "%s\\limits", dir );
+    if (!(f = fopen( path, "r" ))) return 0;
+    while (fgets( line, sizeof(line), f ))
+        if (!strncmp( line, "Max nice priority", 17 )) ok = atoi( line + 26 ) > 20;
+    fclose( f );
+    return ok;
+}
+
+static int can_raise = 1;
+
 static int raised(void)
 {
     int nice = linux_nice();
@@ -99,13 +153,16 @@ static DWORD WINAPI worker( void *arg )
     HANDLE h, h2;
     int p, nice0 = linux_nice();
 
-    printf( "running on %s\n", nice0 == 1000 ? "Windows" : "Wine (Linux nice checks)" );
+    if (nice0 != 1000) can_raise = host_can_raise();
+    printf( "running on %s\n", nice0 == 1000 ? "Windows" : can_raise ? "Wine (Linux nice checks)"
+            : "Wine, the host cannot raise priorities (no rtkit, RLIMIT_NICE <= 20): priority checks skipped" );
 
     SetLastError( 0xdeadbeef );
     h = AvSetMmThreadCharacteristicsA( "Audio", &index );
     CHECK( h != NULL && index > 0, "set Audio: handle %p index %lu", h, index );
-    CHECK( raised(), "Audio raises the thread priority (GetThreadPriority %d, nice %d)",
-           GetThreadPriority( GetCurrentThread() ), linux_nice() );
+    if (can_raise)
+        CHECK( raised(), "Audio raises the thread priority (GetThreadPriority %d, nice %d)",
+               GetThreadPriority( GetCurrentThread() ), linux_nice() );
     CHECK( AvQuerySystemResponsiveness( h, &resp ) && resp == 20, "AvQuerySystemResponsiveness = %lu", resp );
     for (p = AVRT_PRIORITY_VERYLOW; p <= AVRT_PRIORITY_CRITICAL; p++)
         CHECK( AvSetMmThreadPriority( h, p ), "AvSetMmThreadPriority(%d)", p );
@@ -174,7 +231,8 @@ static DWORD WINAPI worker( void *arg )
     index = 0;
     SetLastError( 0xdeadbeef );
     h = AvSetMmMaxThreadCharacteristicsA( "Audio", NULL, &index );
-    CHECK( h != NULL && raised(), "AvSetMmMaxThreadCharacteristics(Audio, NULL) is Audio (err %lu)", h ? 0 : GetLastError() );
+    CHECK( h != NULL && (!can_raise || raised()), "AvSetMmMaxThreadCharacteristics(Audio, NULL) is Audio (err %lu)",
+           h ? 0 : GetLastError() );
     if (h) AvRevertMmThreadCharacteristics( h );
     return 0;
 }

@@ -91,7 +91,15 @@ int main( int argc, char **argv )
         SetLastError( 0xdeadbeef );
         r = CryptProtectMemory( NULL, 0, 0 );
         err = GetLastError();
-        CHECK( !r, "NULL, length 0 fails (error %lu)", err );
+        CHECK( !r && err == ERROR_INVALID_PARAMETER, "NULL, length 0 fails with ERROR_INVALID_PARAMETER (%lu)", err );
+        SetLastError( 0xdeadbeef );
+        r = CryptProtectMemory( NULL, 16, 0 );
+        err = GetLastError();
+        CHECK( !r && err == ERROR_NOACCESS, "NULL, length 16 fails with ERROR_NOACCESS (%lu)", err );
+        SetLastError( 0xdeadbeef );
+        r = CryptUnprotectMemory( NULL, 16, 0 );
+        err = GetLastError();
+        CHECK( !r && err == ERROR_NOACCESS, "unprotect NULL fails with ERROR_NOACCESS (%lu)", err );
     }
     CHECK( pRtlEncryptMemory( a, 15, 0 ) == (LONG)0xc000000d /* STATUS_INVALID_PARAMETER */, "RtlEncryptMemory length 15" );
     CHECK( pRtlEncryptMemory( a, 16, 7 ) == (LONG)0xc000000d /* STATUS_INVALID_PARAMETER */, "RtlEncryptMemory options 7" );
