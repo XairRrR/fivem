@@ -1037,7 +1037,7 @@ void UI_CreateWindow()
 	int wwidth = 500;
 	int wheight = 139;
 
-	if (!g_uui.tenMode)
+	auto createClassicUI = [&]()
 	{
 		INITCOMMONCONTROLSEX controlSex;
 		controlSex.dwSize = sizeof(controlSex);
@@ -1064,54 +1064,73 @@ void UI_CreateWindow()
 		g_uui.progressBar = progressBar;
 		g_uui.topStatic = static1;
 		g_uui.bottomStatic = static2;
-	}
-	else
+	};
+
+	if (g_uui.tenMode)
 	{
-		wwidth = 525;
-		wheight = 525;
-
-		// make TenUI
-		auto ten = std::make_unique<TenUI>();
-		ten->uiSource = std::move(DesktopWindowXamlSource{});
-
-		// attach window
-		auto interop = ten->uiSource.as<IDesktopWindowXamlSourceNative>();
-		winrt::check_hresult(interop->AttachToWindow(rootWindow));
-
-		// setup position
-		HWND childHwnd;
-		interop->get_WindowHandle(&childHwnd);
-
-		SetWindowLong(childHwnd, GWL_EXSTYLE, GetWindowLong(childHwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_LAYERED);
-
-		SetWindowPos(childHwnd, 0, 0, 0, g_dpi.ScaleX(wwidth), g_dpi.ScaleY(wheight), SWP_SHOWWINDOW);
-
-		auto doc = winrt::Windows::UI::Xaml::Markup::XamlReader::Load(g_mainXaml);
-		auto ui = doc.as<winrt::Windows::UI::Xaml::FrameworkElement>();
-
+		try
 		{
-			auto sc = ui.FindName(L"Overlay").as<winrt::Windows::UI::Xaml::Controls::SwapChainPanel>();
+			wwidth = 525;
+			wheight = 525;
 
-			auto time = std::time(nullptr);
-			auto datetime = std::localtime(&time);
-			auto month = datetime->tm_mon + 1;
+			// make TenUI
+			auto ten = std::make_unique<TenUI>();
+			ten->uiSource = std::move(DesktopWindowXamlSource{});
 
-			// Snow effect for December and January
-			if (month == 12 || month == 1)
+			// attach window
+			auto interop = ten->uiSource.as<IDesktopWindowXamlSourceNative>();
+			winrt::check_hresult(interop->AttachToWindow(rootWindow));
+
+			// setup position
+			HWND childHwnd;
+			interop->get_WindowHandle(&childHwnd);
+
+			SetWindowLong(childHwnd, GWL_EXSTYLE, GetWindowLong(childHwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_LAYERED);
+
+			SetWindowPos(childHwnd, 0, 0, 0, g_dpi.ScaleX(wwidth), g_dpi.ScaleY(wheight), SWP_SHOWWINDOW);
+
+			auto doc = winrt::Windows::UI::Xaml::Markup::XamlReader::Load(g_mainXaml);
+			auto ui = doc.as<winrt::Windows::UI::Xaml::FrameworkElement>();
+
 			{
-				InitializeRenderOverlay(sc, g_dpi.ScaleX(wwidth), g_dpi.ScaleY(wheight));
+				auto sc = ui.FindName(L"Overlay").as<winrt::Windows::UI::Xaml::Controls::SwapChainPanel>();
+
+				auto time = std::time(nullptr);
+				auto datetime = std::localtime(&time);
+				auto month = datetime->tm_mon + 1;
+
+				// Snow effect for December and January
+				if (month == 12 || month == 1)
+				{
+					InitializeRenderOverlay(sc, g_dpi.ScaleX(wwidth), g_dpi.ScaleY(wheight));
+				}
 			}
+
+			ten->topStatic = ui.FindName(L"static1").as<winrt::Windows::UI::Xaml::Controls::TextBlock>();
+			ten->bottomStatic = ui.FindName(L"static2").as<winrt::Windows::UI::Xaml::Controls::TextBlock>();
+			ten->progressBar = ui.FindName(L"progressBar").as<winrt::Windows::UI::Xaml::Controls::ProgressBar>();
+
+			ten->uiSource.Content(ui);
+
+			g_uui.tenWindow = FindWindowExW(rootWindow, NULL, L"Windows.UI.Core.CoreWindow", NULL);
+
+			g_uui.ten = std::move(ten);
 		}
+		catch (...)
+		{
+			// XAML content creation failed (XAML Islands unavailable): use the classic UI
+			trace("Failed to create the XAML updater UI, using the classic updater UI.\n");
+			g_uui.ten = {};
+			g_uui.tenWindow = NULL;
+			g_uui.tenMode = false;
+			wwidth = 500;
+			wheight = 139;
+		}
+	}
 
-		ten->topStatic = ui.FindName(L"static1").as<winrt::Windows::UI::Xaml::Controls::TextBlock>();
-		ten->bottomStatic = ui.FindName(L"static2").as<winrt::Windows::UI::Xaml::Controls::TextBlock>();
-		ten->progressBar = ui.FindName(L"progressBar").as<winrt::Windows::UI::Xaml::Controls::ProgressBar>();
-
-		ten->uiSource.Content(ui);
-
-		g_uui.tenWindow = FindWindowExW(rootWindow, NULL, L"Windows.UI.Core.CoreWindow", NULL);
-
-		g_uui.ten = std::move(ten);
+	if (!g_uui.tenMode)
+	{
+		createClassicUI();
 	}
 
 	g_uui.rootWindow = rootWindow;
@@ -1347,8 +1366,10 @@ std::unique_ptr<TenUIBase> UI_InitTen()
 		{
 			return std::make_unique<TenUIStorage>();
 		}
-		catch (const std::exception&)
+		catch (...)
 		{
+			// winrt::hresult_error does not derive from std::exception
+			g_uui.tenMode = false;
 		}
 	}
 
@@ -1364,9 +1385,19 @@ void UI_DoCreation(bool safeMode)
 {
 	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
-	if (g_tenUI)
+	if (g_tenUI && g_uui.tenMode)
 	{
-		g_tenUI->InitManager();
+		try
+		{
+			g_tenUI->InitManager();
+		}
+		catch (...)
+		{
+			// XAML Islands unavailable (e.g. Wine, Windows editions without Windows.UI.Xaml):
+			// fall back to the classic Win32 updater UI instead of terminating.
+			trace("XAML Islands unavailable, using the classic updater UI.\n");
+			g_uui.tenMode = false;
+		}
 	}
 
 	if (IsWindows7OrGreater())
