@@ -4,6 +4,14 @@
 #include <avrt.h>
 #include <stdio.h>
 
+/* calls that may fault on Windows (e.g. a NULL output pointer) report it instead of killing the test */
+#ifdef _MSC_VER
+#define GUARD(what, call) __try { call; } __except (EXCEPTION_EXECUTE_HANDLER) { \
+    printf( "%-36s EXCEPTION %08lx\n", what, GetExceptionCode() ); }
+#else
+#define GUARD(what, call) do { call; } while (0)
+#endif
+
 static void show( const char *what, HANDLE h, DWORD index )
 {
     DWORD err = GetLastError();
@@ -28,7 +36,7 @@ static DWORD WINAPI worker( void *arg )
         index = 0;
         SetLastError( 0xdeadbeef );
         h = AvSetMmThreadCharacteristicsA( tasks[i], &index );
-        sprintf( what, "set \"%s\"", tasks[i] );
+        snprintf( what, sizeof(what), "set \"%s\"", tasks[i] );
         show( what, h, index );
         if (h)
         {
@@ -66,21 +74,19 @@ static DWORD WINAPI worker( void *arg )
     if (h) AvRevertMmThreadCharacteristics( h );
 
     SetLastError( 0xdeadbeef );
-    h = AvSetMmThreadCharacteristicsA( NULL, &index );
-    show( "set NULL name", h, index );
+    GUARD( "set NULL name", h = AvSetMmThreadCharacteristicsA( NULL, &index ); show( "set NULL name", h, index ) );
     SetLastError( 0xdeadbeef );
-    h = AvSetMmThreadCharacteristicsA( "Audio", NULL );
-    show( "set NULL index", h, 0 );
-    if (h) AvRevertMmThreadCharacteristics( h );
+    GUARD( "set NULL index", h = AvSetMmThreadCharacteristicsA( "Audio", NULL ); show( "set NULL index", h, 0 );
+           if (h) AvRevertMmThreadCharacteristics( h ) );
     SetLastError( 0xdeadbeef );
-    r = AvRevertMmThreadCharacteristics( NULL );
-    printf( "revert NULL %d err %lu\n", r, r ? 0 : GetLastError() );
+    GUARD( "revert NULL", r = AvRevertMmThreadCharacteristics( NULL );
+           printf( "revert NULL %d err %lu\n", r, r ? 0 : GetLastError() ) );
     SetLastError( 0xdeadbeef );
-    r = AvSetMmThreadPriority( NULL, AVRT_PRIORITY_HIGH );
-    printf( "set priority NULL %d err %lu\n", r, r ? 0 : GetLastError() );
+    GUARD( "set priority NULL", r = AvSetMmThreadPriority( NULL, AVRT_PRIORITY_HIGH );
+           printf( "set priority NULL %d err %lu\n", r, r ? 0 : GetLastError() ) );
     SetLastError( 0xdeadbeef );
-    r = AvQuerySystemResponsiveness( NULL, &resp );
-    printf( "responsiveness NULL %d err %lu value %lu\n", r, r ? 0 : GetLastError(), resp );
+    GUARD( "responsiveness NULL", r = AvQuerySystemResponsiveness( NULL, &resp );
+           printf( "responsiveness NULL %d err %lu value %lu\n", r, r ? 0 : GetLastError(), resp ) );
 
     index = 0;
     SetLastError( 0xdeadbeef );
@@ -97,6 +103,7 @@ static DWORD WINAPI worker( void *arg )
 
 int main(void)
 {
+    setvbuf( stdout, NULL, _IONBF, 0 );
     HANDLE t = CreateThread( NULL, 0, worker, NULL, 0, NULL );
     WaitForSingleObject( t, INFINITE );
     printf( "RESULT: PASS\n" );   /* exploration only */
