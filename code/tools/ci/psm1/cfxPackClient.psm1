@@ -51,6 +51,19 @@ function Invoke-PackClient {
         Copy-Item -Force -Recurse $projectRoot\data\client_rdr\*             $packRoot\
     }
 
+    # Ship the VC++ runtime of the toolset that built the client. data\redist\crt matches
+    # Cfx.re's own toolset; binaries from MSVC 14.40+ (VS 2022 17.10+) crash in std::mutex /
+    # std::condition_variable with an older msvcp140.dll.
+    if ($env:VCToolsRedistDir) {
+        $toolsetCrt = [IO.Path]::Combine($env:VCToolsRedistDir, "x64", "Microsoft.VC143.CRT")
+
+        if (Test-Path $toolsetCrt) {
+            Copy-Item -Force $toolsetCrt\*.dll $packRoot\bin\
+        } else {
+            $Context.addBuildWarning("VC++ runtime of the toolset not found in $toolsetCrt, keeping data\redist\crt")
+        }
+    }
+
     # Adding build output
     Copy-Item -Force $binRoot\*.dll                      $packRoot\
     Copy-Item -Force $binRoot\*.com                      $packRoot\
