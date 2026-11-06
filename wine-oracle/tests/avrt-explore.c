@@ -194,20 +194,37 @@ static DWORD WINAPI worker( void *arg )
         h = AvSetMmMaxThreadCharacteristicsA( "Audio", NULL, &idx );
         show( "null: max(Audio, NULL) with 0", h, idx );
         if (h) AvRevertMmThreadCharacteristics( h );
+        /* max(NULL, Pro Audio) kills the process on Windows (run 42308701768) */
         idx = 0;
         SetLastError( 0xdeadbeef );
-        h = AvSetMmMaxThreadCharacteristicsA( NULL, "Pro Audio", &idx );
-        show( "null: max(NULL, Pro Audio) with 0", h, idx );
-        if (h) AvRevertMmThreadCharacteristics( h );
+        GUARD( "null: max(NULL, Pro Audio)", h = AvSetMmMaxThreadCharacteristicsA( NULL, "Pro Audio", &idx );
+               show( "null: max(NULL, Pro Audio) with 0", h, idx ); if (h) AvRevertMmThreadCharacteristics( h ) );
         idx = 0;
         SetLastError( 0xdeadbeef );
         GUARD( "null: max(NULL, NULL)", h = AvSetMmMaxThreadCharacteristicsA( NULL, NULL, &idx );
                show( "null: max(NULL, NULL) with 0", h, idx ); if (h) AvRevertMmThreadCharacteristics( h ) );
         idx = 0;
         SetLastError( 0xdeadbeef );
-        h = AvSetMmMaxThreadCharacteristicsA( "Bogus Task", "Audio", &idx );
-        show( "null: max(Bogus Task, Audio) with 0", h, idx );
-        if (h) AvRevertMmThreadCharacteristics( h );
+        GUARD( "null: max(Bogus Task, Audio)", h = AvSetMmMaxThreadCharacteristicsA( "Bogus Task", "Audio", &idx );
+               show( "null: max(Bogus Task, Audio) with 0", h, idx ); if (h) AvRevertMmThreadCharacteristics( h ) );
+        idx = 0;
+        SetLastError( 0xdeadbeef );
+        GUARD( "null: max(Audio, Bogus Task)", h = AvSetMmMaxThreadCharacteristicsA( "Audio", "Bogus Task", &idx );
+               show( "null: max(Audio, Bogus Task) with 0", h, idx ); if (h) AvRevertMmThreadCharacteristics( h ) );
+        idx = 0;
+        SetLastError( 0xdeadbeef );
+        h = AvSetMmMaxThreadCharacteristicsA( "Capture", "Window Manager", &idx );
+        show( "null: max(Capture, Window Manager) tie", h, idx );
+        if (h)
+        {
+            join_index = idx;
+            join_task1 = "Window Manager";
+            join_task2 = NULL;
+            WaitForSingleObject( CreateThread( NULL, 0, join_thread, NULL, 0, NULL ), INFINITE );
+            join_task1 = "Capture";
+            WaitForSingleObject( CreateThread( NULL, 0, join_thread, NULL, 0, NULL ), INFINITE );
+            AvRevertMmThreadCharacteristics( h );
+        }
     }
     printf( "end thread priority %d\n", GetThreadPriority( GetCurrentThread() ) );
     return 0;

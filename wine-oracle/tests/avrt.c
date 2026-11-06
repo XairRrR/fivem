@@ -1,6 +1,6 @@
 /* MMCSS (avrt.dll). Valeurs attendues relevées sur Windows Server 2022 (tests/avrt-explore.c,
- * oracle run 42307099955). L'effet sur la priorité est vérifié avec GetThreadPriority() sous
- * Windows, et avec la valeur nice du thread Linux (Z:\proc\thread-self\stat) sous Wine. */
+ * oracle runs 42307099955, 42307853831, 42308701768). L'effet sur la priorité est vérifié avec GetThreadPriority() sous
+ * Windows, et avec la plus basse valeur nice des threads Linux du processus (Z:\proc) sous Wine. */
 #include <windows.h>
 #include <avrt.h>
 #include <stdio.h>
@@ -71,16 +71,23 @@ static int raised(void)
 
 static DWORD shared_index;
 
-/* a second thread joining the task of the first one with its index */
+/* a second thread joining the task of the first one with its index (measured on Windows: the
+ * index belongs to the task that won AvSetMmMaxThreadCharacteristics, Pro Audio here) */
 static DWORD WINAPI joiner( void *arg )
 {
     DWORD index = shared_index;
     HANDLE h;
 
     SetLastError( 0xdeadbeef );
+    h = AvSetMmThreadCharacteristicsA( "pro audio", &index );
+    CHECK( h != NULL && index == shared_index, "another thread joins the active Pro Audio task %lu (err %lu, index %lu)",
+           shared_index, h ? 0 : GetLastError(), index );
+    if (h) AvRevertMmThreadCharacteristics( h );
+
+    SetLastError( 0xdeadbeef );
     h = AvSetMmThreadCharacteristicsA( "Audio", &index );
-    CHECK( h != NULL && index == shared_index, "another thread joins the active task %lu (handle %p, err %lu, index %lu)",
-           shared_index, h, h ? 0 : GetLastError(), index );
+    CHECK( !h && GetLastError() == ERROR_INVALID_TASK_INDEX,
+           "joining it as another task fails with ERROR_INVALID_TASK_INDEX (%lu)", GetLastError() );
     if (h) AvRevertMmThreadCharacteristics( h );
     return 0;
 }
@@ -167,8 +174,8 @@ static DWORD WINAPI worker( void *arg )
     index = 0;
     SetLastError( 0xdeadbeef );
     h = AvSetMmMaxThreadCharacteristicsA( "Audio", NULL, &index );
-    CHECK( !h && GetLastError() == ERROR_INVALID_TASK_INDEX,
-           "AvSetMmMaxThreadCharacteristics(Audio, NULL) fails with ERROR_INVALID_TASK_INDEX (%lu)", GetLastError() );
+    CHECK( h != NULL && raised(), "AvSetMmMaxThreadCharacteristics(Audio, NULL) is Audio (err %lu)", h ? 0 : GetLastError() );
+    if (h) AvRevertMmThreadCharacteristics( h );
     return 0;
 }
 
