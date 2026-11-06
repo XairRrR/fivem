@@ -95,8 +95,12 @@ function Invoke-PackClient {
     Copy-Item -Force $bootstrapperPath $packRoot\CitizenFX.exe
     Copy-Item -Force $bootstrapperPath $cachesRoot\CitizenFX.exe
 
-    # From closed
-    Copy-Item -Force $binRoot\RGL-ElevationHelper.exe $packRoot\
+    # From closed - only available on Cfx.re's own CI, optional for public builds
+    if (Test-Path $binRoot\RGL-ElevationHelper.exe) {
+        Copy-Item -Force $binRoot\RGL-ElevationHelper.exe $packRoot\
+    } else {
+        $Context.addBuildWarning("RGL-ElevationHelper.exe not found (closed component), not packing it")
+    }
 
     # upload review jobs will use this compressed bootstrap file
     Remove-Item -Force -ErrorAction ignore $bootstrapperCompressedPath

@@ -1,0 +1,96 @@
+# Builds the FiveM client from this branch with Cfx.re's own build pipeline
+# (code/tools/ci/build_client.ps1) in dry-run mode: nothing is uploaded to Cfx.re,
+# private/closed components are not available and are skipped.
+# The result is packaged for Wine/Proton and kept as a private workflow artifact.
+name: Build FiveM client (linux-native)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    # Cfx.re's pipeline targets VS 2022 (premake vs2022, node-gyp 9 does not know VS 2026)
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    env:
+      CI: "true"
+      CI_PROJECT_DIR: ${{ github.workspace }}
+      CI_COMMIT_REF_NAME: ${{ github.ref_name }}
+      CI_COMMIT_SHA: ${{ github.sha }}
+      CFX_PRODUCT_NAME: fivem
+      CFX_DRY_RUN: "true"
+      CFX_RETAIL_BUILD: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # node-gyp 9 (native-doc-tooling prebuild) needs distutils, removed in Python 3.12
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Toolchain info
+        shell: pwsh
+        run: |
+          python --version; py --version; node --version; yarn --version
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" | Select-Object -ExpandProperty Name
+
+      # code/premake5.lua pins systemversion 10.0.22000.0, which the runner image lacks
+      - name: Install Windows SDK 10.0.22000
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.22000.0\um") { exit 0 }
+          $setup = Join-Path $env:RUNNER_TEMP 'winsdksetup.exe'
+          Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2173743' -OutFile $setup
+          $p = Start-Process -Wait -PassThru $setup -ArgumentList '/features', '+', '/quiet', '/norestart', '/ceip', 'off'
+          if ($p.ExitCode -ne 0) { throw "winsdksetup exited with $($p.ExitCode)" }
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" | Select-Object -ExpandProperty Name
+
+      - name: Build and pack client (Cfx.re pipeline, dry run)
+        shell: pwsh
+        env:
+          npm_config_python: ${{ steps.python.outputs.python-path }}
+        run: .\code\tools\ci\build_client.ps1
+
+      - name: Package for Wine/Proton
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'FiveM'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item -Recurse -Force caches\fivereborn\* $stage
+          Move-Item (Join-Path $stage 'CitizenFX.exe') (Join-Path $stage 'FiveM.exe')
+          # FiveM's own developer mode: skip the official auto-updater, which would
+          # replace this build with the official one (launcher/Main.cpp).
+          New-Item -ItemType File (Join-Path $stage 'FiveM.exe.formaldev') | Out-Null
+          "${{ github.sha }}" | Out-File -Encoding ascii (Join-Path $stage 'linux-native-commit.txt')
+          7z a -tzip fivem-client-linux-native.zip $stage
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+
+      - name: Upload client
+        uses: actions/upload-artifact@v4
+        with:
+          name: fivem-client-linux-native
+          path: fivem-client-linux-native.zip
+          compression-level: 0
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            .build-cache/build/**/*.log
+            code/build/**/*.log
+          if-no-files-found: ignore
