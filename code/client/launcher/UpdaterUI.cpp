@@ -9,7 +9,6 @@
 #include <CommCtrl.h>
 #include <ctime>
 #include <chrono>
-#include <atomic>
 
 #ifdef LAUNCHER_PERSONALITY_MAIN
 #include <shobjidl.h>
@@ -88,19 +87,6 @@ struct TenUI
 	winrt::Windows::UI::Xaml::Controls::TextBlock bottomStatic{ nullptr };
 	winrt::Windows::UI::Xaml::Controls::ProgressBar progressBar{ nullptr };
 };
-
-// Set once XAML Islands failed to initialize in this process (e.g. under Wine, or Windows
-// editions without Windows.UI.Xaml), so later updater windows don't retry it.
-static std::atomic<bool> g_tenUnavailable;
-
-static void UI_MarkTenUnavailable(const char* reason)
-{
-	g_tenUnavailable = true;
-
-	// not trace(): the updater UI thread may run while CoreRT.dll is still initializing
-	// (its console isn't constructed yet), and CoreTrace would crash.
-	OutputDebugStringA(reason);
-}
 
 //static thread_local struct  
 static struct
@@ -1133,7 +1119,7 @@ void UI_CreateWindow()
 		catch (...)
 		{
 			// XAML content creation failed (XAML Islands unavailable): use the classic UI
-			UI_MarkTenUnavailable("Failed to create the XAML updater UI, using the classic updater UI.\n");
+			trace("Failed to create the XAML updater UI, using the classic updater UI.\n");
 			g_uui.ten = {};
 			g_uui.tenWindow = NULL;
 			g_uui.tenMode = false;
@@ -1366,11 +1352,6 @@ std::unique_ptr<TenUIBase> UI_InitTen()
 		forceOff = true;
 	}
 
-	if (g_tenUnavailable)
-	{
-		forceOff = true;
-	}
-
 #ifdef IS_LAUNCHER
 	forceOff = true;
 #endif
@@ -1414,7 +1395,7 @@ void UI_DoCreation(bool safeMode)
 		{
 			// XAML Islands unavailable (e.g. Wine, Windows editions without Windows.UI.Xaml):
 			// fall back to the classic Win32 updater UI instead of terminating.
-			UI_MarkTenUnavailable("XAML Islands unavailable, using the classic updater UI.\n");
+			trace("XAML Islands unavailable, using the classic updater UI.\n");
 			g_uui.tenMode = false;
 		}
 	}
