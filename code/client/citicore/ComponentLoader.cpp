@@ -188,12 +188,24 @@ void ComponentLoader::InitializeWithString(std::string_view cacheBuf)
 						environmentType = L"Windows on ARM";
 					}
 
-					MessageBoxW(NULL, 
-						va(
-							L"The game is running in insecure mode because %s is not supported by the anti-cheat components at this time.\n"
-							L"Most servers, as well as some authentication features will be unavailable.",
-							environmentType),
-						L"Cfx.re: Insecure mode", MB_OK | MB_ICONWARNING);
+					trace("The game is running in insecure mode because %s is not supported by the anti-cheat components at this time.\n",
+						ToNarrow(environmentType));
+
+					// Only show the (blocking) notice once per installation, it would otherwise stop every launch.
+					const std::wstring iniPath = MakeRelativeCitPath(L"CitizenFX.ini");
+
+					if (GetPrivateProfileIntW(L"Game", L"InsecureModeNoticeShown", 0, iniPath.c_str()) == 0)
+					{
+						MessageBoxW(NULL, 
+							va(
+								L"The game is running in insecure mode because %s is not supported by the anti-cheat components at this time.\n"
+								L"Most servers, as well as some authentication features will be unavailable.\n\n"
+								L"This notice will not be shown again.",
+								environmentType),
+							L"Cfx.re: Insecure mode", MB_OK | MB_ICONWARNING);
+
+						WritePrivateProfileStringW(L"Game", L"InsecureModeNoticeShown", L"1", iniPath.c_str());
+					}
 				}
 
 				AddComponent(new DllGameComponent(va(PLATFORM_LIBRARY_STRING, L"sticky")));
