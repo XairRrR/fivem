@@ -69,7 +69,9 @@ int main(void)
     TRY( "registerEx again", WTSRegisterSessionNotificationEx( WTS_CURRENT_SERVER_HANDLE, hwnd, NOTIFY_FOR_THIS_SESSION ) );
     TRY( "unregisterEx", WTSUnRegisterSessionNotificationEx( WTS_CURRENT_SERVER_HANDLE, hwnd ) );
     TRY( "unregisterEx again", WTSUnRegisterSessionNotificationEx( WTS_CURRENT_SERVER_HANDLE, hwnd ) );
-    TRY( "registerEx bogus server", WTSRegisterSessionNotificationEx( (HANDLE)0x5678, hwnd, NOTIFY_FOR_THIS_SESSION ) );
+    /* crashes on Windows (oracle run 42313418361) */
+    GUARD( "registerEx bogus server",
+           TRY( "registerEx bogus server", WTSRegisterSessionNotificationEx( (HANDLE)0x5678, hwnd, NOTIFY_FOR_THIS_SESSION ) ) );
 
     TRY( "register then destroy", WTSRegisterSessionNotification( hwnd, NOTIFY_FOR_THIS_SESSION ) );
     DestroyWindow( hwnd );
