@@ -75,8 +75,9 @@ static BOOL run_capture( const char *cmd, char *buf, DWORD size )
     return total > 0;
 }
 
-/* 1 if the host lists a request of this process keeping the system awake, 0 if not, -1 if unknown */
-static int system_kept_awake(void)
+/* 1 if the host lists a request of this process of this kind, 0 if not, -1 if unknown. Windows lists
+ * display and system requests in their own sections; on Linux both are a logind "idle" inhibitor. */
+static int kept_awake( const char *section_name )
 {
     static char out[65536];
     char *line, *next, section[64] = "";
@@ -97,17 +98,19 @@ static int system_kept_awake(void)
             if (strstr( line, "Wine: " ) && strstr( line, exe_name ) && strstr( line, "idle" )) found = 1;
         }
         else if (n && line[n - 1] == ':') snprintf( section, sizeof(section), "%s", line );
-        else if (!strcmp( section, "SYSTEM:" ) && strstr( line, exe_name )) found = 1;
+        else if (!strcmp( section, section_name ) && strstr( line, exe_name )) found = 1;
     }
     return found;
 }
 
-static void check_host( int expected, const char *when )
+static void check_host_kind( const char *section, int expected, const char *when )
 {
-    int state = system_kept_awake();
+    int state = kept_awake( section );
     if (state < 0) printf( "skip: host power requests not visible (%s)\n", when );
-    else CHECK( state == expected, "host %s the system awake %s", expected ? "keeps" : "no longer keeps", when );
+    else CHECK( state == expected, "host %s %s %s", expected ? "lists" : "does not list", section, when );
 }
+
+#define check_host( expected, when ) check_host_kind( "SYSTEM:", expected, when )
 
 int main(void)
 {
@@ -166,8 +169,9 @@ int main(void)
     check_host( 0, "after clearing" );
 
     CHECK( PowerSetRequest( h, PowerRequestDisplayRequired ), "set display" );
-    check_host( 1, "after a display request" );
+    check_host_kind( "DISPLAY:", 1, "after a display request" );
     CHECK( PowerClearRequest( h, PowerRequestDisplayRequired ), "clear display" );
+    check_host_kind( "DISPLAY:", 0, "after clearing the display request" );
 
     /* a request closed without being cleared is dropped */
     h2 = PowerCreateRequest( &ctx );
