@@ -61,10 +61,10 @@ function Invoke-UploadClientSymbols {
     $symUploadDir = $Context.getPathInBuildCache("symbols\sym-upload")
     $lastSymDateFilePath = $Context.getPathInBuildCache("symbols\last-upload-datetime.txt")
 
-    Remove-Item -Force -Recurse $symUploadDir
+    Remove-Item -Force -Recurse -ErrorAction Ignore $symUploadDir
     New-Item -ItemType Directory -Force $symUploadDir
 
-    Remove-Item -Force -Recurse $symTmpDir
+    Remove-Item -Force -Recurse -ErrorAction Ignore $symTmpDir
     New-Item -ItemType Directory -Force $symTmpDir
 
     # setting a really old date by default so if no symbols have been dumped before we'd dump them now
