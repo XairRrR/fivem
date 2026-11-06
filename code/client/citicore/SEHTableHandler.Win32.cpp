@@ -158,6 +158,13 @@ static PVOID RtlImageDirectoryEntryToDataStub(HMODULE hModule, BOOL a2, WORD dir
 	return g_origRtlImageDirectoryEntryToData(hModule, a2, directory, size);
 }
 
+static void HookImageDirectoryEntry()
+{
+	DisableToolHelpScope scope;
+	MH_CreateHookApi(L"ntdll.dll", "RtlImageDirectoryEntryToData", RtlImageDirectoryEntryToDataStub, (void**)&g_origRtlImageDirectoryEntryToData);
+	MH_EnableHook(MH_ALL_HOOKS);
+}
+
 extern "C" void DLL_EXPORT CoreRT_SetupSEHHandler(void* moduleBase, void* moduleEnd, PRUNTIME_FUNCTION runtimeFunctions, DWORD entryCount)
 {
 	// store passed data
@@ -209,12 +216,18 @@ extern "C" void DLL_EXPORT CoreRT_SetupSEHHandler(void* moduleBase, void* module
 
 			if (!internalAddress)
 			{
-				// and 2k3 to 7 don't even _have_ Rtlpx - so we directly hook the Rtl* function
+				// Win8+ is supposed to have RtlpxLookupFunctionTable. If it can't be found, this ntdll doesn't
+				// match the layout we know (e.g. Wine, which implements function table lookup on top of
+				// RtlImageDirectoryEntryToData): use the image directory hook instead of failing.
 				if (IsWindows8OrGreater())
 				{
-					FatalError("Could not find RtlpxLookupFunctionTable - hooking RtlLookupFunctionTable directly. This will break on a Win8+ system since RtlpxLookupFunctionTable is supposed to exist!\n");
+					trace("Could not find RtlpxLookupFunctionTable - using the image directory hook instead.\n");
+
+					HookImageDirectoryEntry();
+					return;
 				}
 
+				// and 2k3 to 7 don't even _have_ Rtlpx - so we directly hook the Rtl* function
 				internalAddress = baseAddress;
 
 				patchFunction = RtlpxLookupFunctionTableOverrideDownLevel;
@@ -231,9 +244,7 @@ extern "C" void DLL_EXPORT CoreRT_SetupSEHHandler(void* moduleBase, void* module
 	{
 		trace("Not running on Windows - no RtlLookupFunctionTable. Is this some fake OS?\n");
 
-		DisableToolHelpScope scope;
-		MH_CreateHookApi(L"ntdll.dll", "RtlImageDirectoryEntryToData", RtlImageDirectoryEntryToDataStub, (void**)&g_origRtlImageDirectoryEntryToData);
-		MH_EnableHook(MH_ALL_HOOKS);
+		HookImageDirectoryEntry();
 	}
 }
 #else
