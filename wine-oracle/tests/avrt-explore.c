@@ -33,6 +33,42 @@ static DWORD WINAPI joiner( void *arg )
     return 0;
 }
 
+/* join: a second thread uses the index of a task still active on the first thread */
+static const char *join_task1, *join_task2;
+
+static DWORD WINAPI join_thread( void *arg )
+{
+    DWORD idx = join_index;
+    char what[80];
+    HANDLE h;
+
+    SetLastError( 0xdeadbeef );
+    if (join_task2) h = AvSetMmMaxThreadCharacteristicsA( join_task1, join_task2, &idx );
+    else h = AvSetMmThreadCharacteristicsA( join_task1, &idx );
+    snprintf( what, sizeof(what), "join: %s%s%s", join_task1, join_task2 ? "+" : "", join_task2 ? join_task2 : "" );
+    show( what, h, idx );
+    if (h) AvRevertMmThreadCharacteristics( h );
+    return 0;
+}
+
+static void join_case( const char *owner1, const char *owner2, const char *task1, const char *task2 )
+{
+    DWORD idx = 0;
+    HANDLE a, t;
+
+    a = owner2 ? AvSetMmMaxThreadCharacteristicsA( owner1, owner2, &idx ) : AvSetMmThreadCharacteristicsA( owner1, &idx );
+    printf( "join: owner %s%s%s index %lu handle %s\n", owner1, owner2 ? "+" : "", owner2 ? owner2 : "", idx,
+            a ? "ok" : "NULL" );
+    if (!a) return;
+    join_index = idx;
+    join_task1 = task1;
+    join_task2 = task2;
+    t = CreateThread( NULL, 0, join_thread, NULL, 0, NULL );
+    WaitForSingleObject( t, INFINITE );
+    CloseHandle( t );
+    AvRevertMmThreadCharacteristics( a );
+}
+
 static DWORD WINAPI worker( void *arg )
 {
     DWORD index = 0;
@@ -145,6 +181,33 @@ static DWORD WINAPI worker( void *arg )
             CloseHandle( t );
             AvRevertMmThreadCharacteristics( a );
         }
+    }
+    join_case( "Audio", NULL, "Audio", NULL );
+    join_case( "Audio", NULL, "audio", NULL );
+    join_case( "Audio", NULL, "Pro Audio", NULL );
+    join_case( "Audio", "Pro Audio", "Audio", "Pro Audio" );
+    join_case( "Audio", "Pro Audio", "Pro Audio", NULL );
+    join_case( "Audio", "Pro Audio", "Audio", NULL );
+    {
+        DWORD idx = 0;
+        SetLastError( 0xdeadbeef );
+        h = AvSetMmMaxThreadCharacteristicsA( "Audio", NULL, &idx );
+        show( "null: max(Audio, NULL) with 0", h, idx );
+        if (h) AvRevertMmThreadCharacteristics( h );
+        idx = 0;
+        SetLastError( 0xdeadbeef );
+        h = AvSetMmMaxThreadCharacteristicsA( NULL, "Pro Audio", &idx );
+        show( "null: max(NULL, Pro Audio) with 0", h, idx );
+        if (h) AvRevertMmThreadCharacteristics( h );
+        idx = 0;
+        SetLastError( 0xdeadbeef );
+        GUARD( "null: max(NULL, NULL)", h = AvSetMmMaxThreadCharacteristicsA( NULL, NULL, &idx );
+               show( "null: max(NULL, NULL) with 0", h, idx ); if (h) AvRevertMmThreadCharacteristics( h ) );
+        idx = 0;
+        SetLastError( 0xdeadbeef );
+        h = AvSetMmMaxThreadCharacteristicsA( "Bogus Task", "Audio", &idx );
+        show( "null: max(Bogus Task, Audio) with 0", h, idx );
+        if (h) AvRevertMmThreadCharacteristics( h );
     }
     printf( "end thread priority %d\n", GetThreadPriority( GetCurrentThread() ) );
     return 0;
