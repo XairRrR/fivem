@@ -24,6 +24,24 @@
 static NTSTATUS(NTAPI* g_origRtlRaiseException)(_In_ PEXCEPTION_RECORD ExceptionRecord);
 static BOOL(NTAPI* g_origZwQueryDebugFilterState)(_In_ ULONG ComponentId, _In_ ULONG Level);
 
+static bool IsWritableMemory(const void* address, size_t size)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+
+	if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT)
+	{
+		return false;
+	}
+
+	if ((const char*)address + size > (const char*)mbi.BaseAddress + mbi.RegionSize)
+	{
+		return false;
+	}
+
+	constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	return (mbi.Protect & writable) != 0 && (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+}
+
 struct HardErrorScope
 {
 	HardErrorScope()
@@ -40,9 +58,15 @@ struct HardErrorScope
 		if (osBuildNumber >= 18362 && osBuildNumber < 19628)
 		{
 			auto fltUsed = (char*)GetProcAddress(GetModuleHandle(L"ntdll.dll"), "_fltused");
-			m_oldLdrFlags = *(int*)(fltUsed - 16);
 
-			*(int*)(fltUsed - 16) |= 2; // loader snaps for error
+			// Only touch the loader flags if they are where we expect them: some ntdll implementations
+			// (e.g. Wine, which reports such a build number) keep _fltused in read-only memory.
+			if (fltUsed && IsWritableMemory(fltUsed - 16, sizeof(int)))
+			{
+				m_oldLdrFlags = *(int*)(fltUsed - 16);
+
+				*(int*)(fltUsed - 16) |= 2; // loader snaps for error
+			}
 		}
 
 		DisableToolHelpScope thScope;
