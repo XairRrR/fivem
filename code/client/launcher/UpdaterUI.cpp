@@ -88,6 +88,10 @@ struct TenUI
 	winrt::Windows::UI::Xaml::Controls::ProgressBar progressBar{ nullptr };
 };
 
+// Set once XAML Islands failed to initialize in this process (e.g. under Wine, or Windows
+// editions without Windows.UI.Xaml), so later updater windows don't retry it.
+static bool g_tenUnavailable;
+
 //static thread_local struct  
 static struct
 {
@@ -1120,6 +1124,7 @@ void UI_CreateWindow()
 		{
 			// XAML content creation failed (XAML Islands unavailable): use the classic UI
 			trace("Failed to create the XAML updater UI, using the classic updater UI.\n");
+			g_tenUnavailable = true;
 			g_uui.ten = {};
 			g_uui.tenWindow = NULL;
 			g_uui.tenMode = false;
@@ -1347,7 +1352,7 @@ std::unique_ptr<TenUIBase> UI_InitTen()
 		forceOff = true;
 	}
 
-	if (getenv("CitizenFX_NoTenUI"))
+	if (getenv("CitizenFX_NoTenUI") || g_tenUnavailable)
 	{
 		forceOff = true;
 	}
@@ -1396,6 +1401,7 @@ void UI_DoCreation(bool safeMode)
 			// XAML Islands unavailable (e.g. Wine, Windows editions without Windows.UI.Xaml):
 			// fall back to the classic Win32 updater UI instead of terminating.
 			trace("XAML Islands unavailable, using the classic updater UI.\n");
+			g_tenUnavailable = true;
 			g_uui.tenMode = false;
 		}
 	}
