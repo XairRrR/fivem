@@ -1,0 +1,57 @@
+# Builds the programs of wine-oracle/tests with MSVC and runs them on a real Windows, so that the
+# values our Wine implementation is tested against are the ones Windows gives.
+name: Wine oracle (Windows)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  oracle:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Checkout the tests only
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: wine-oracle
+          submodules: false
+          fetch-depth: 1
+
+      - name: Build and run on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^(.*?)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2] }
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'oracle'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          "Windows: $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version)" | Tee-Object (Join-Path $out 'system.txt')
+          $rows = @('| test | result |', '|---|---|')
+          $failed = 0
+          foreach ($t in Get-ChildItem wine-oracle/tests/*.c) {
+            $exe = Join-Path $out ($t.BaseName + '.exe')
+            $obj = Join-Path $out ($t.BaseName + '.obj')
+            cl /nologo /W3 /Fe:$exe /Fo:$obj $t.FullName user32.lib crypt32.lib advapi32.lib shell32.lib
+            if ($LASTEXITCODE -ne 0) { $rows += "| $($t.BaseName) | build failed |"; $failed++; continue }
+            $log = & $exe 2>&1 | Out-String
+            Set-Content -Path (Join-Path $out ($t.BaseName + '.txt')) -Value $log
+            if ($log -match 'RESULT: PASS') { $res = 'PASS' } else { $res = 'FAIL'; $failed++ }
+            $rows += "| $($t.BaseName) | $res |"
+            Write-Output "::group::$($t.BaseName): $res"
+            Write-Output $log
+            Write-Output '::endgroup::'
+          }
+          $rows -join "`n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($failed) { throw "$failed test(s) differ from the expected Windows behaviour" }
+
+      - name: Upload the outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wine-oracle-results
+          path: ${{ runner.temp }}/oracle/*.txt
