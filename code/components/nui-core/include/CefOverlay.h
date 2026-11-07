@@ -413,6 +413,13 @@ namespace nui
 	OVERLAY_DECL void ExecuteWindowScript(const std::string& windowName, const std::string& scriptBit);
 	OVERLAY_DECL void SetNUIWindowURL(fwString windowName, fwString url);
 
+	// a window rendered by the native Linux host (a DUI): no CEF browser, these replace its use
+	OVERLAY_DECL bool IsNativeWindow(const std::string& windowName);
+	OVERLAY_DECL bool IsNativeWindowAvailable(const std::string& windowName);
+	// fnui_input type (1 move, 2 down, 3 up, 4 wheel), button (0 left, 1 right, 2 middle), a/b:
+	// click count, or wheel deltas x/y
+	OVERLAY_DECL void SendNativeWindowInput(const std::string& windowName, int type, int button, int x, int y, int a, int b);
+
 	OVERLAY_DECL void SwitchContext(const std::string& contextId);
 
 #ifdef WANT_CEF_INTERNALS

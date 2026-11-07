@@ -9,6 +9,8 @@
 
 #include <include/cef_scheme.h>
 
+#include "CefOverlay.h"
+
 namespace nui::native
 {
 // true when a native Linux host renders the NUI (CitizenFX_NativeNUIFrames set and the host's
@@ -27,4 +29,20 @@ void RegisterFactory(const std::string& scheme, const std::string& domain, CefRe
 
 // load a page in the host's main frame
 void Navigate(const std::string& url);
+
+// DUI browsers (CREATE_DUI) rendered by the host, when it renders the main menu too: each has its
+// own frame file, copied into the DUI's texture on the render thread (wine-fivem nui-host/src/dui.h)
+// false: not handled natively (the caller creates a CEF browser)
+bool CreateDui(const std::string& handle, int width, int height, const std::string& url);
+bool IsDui(const std::string& handle);
+void DestroyDui(const std::string& handle);
+void SetDuiUrl(const std::string& handle, const std::string& url);
+void RunDuiScript(const std::string& handle, const std::string& code);
+// fnui_input type, button (0 left, 1 right, 2 middle), DUI pixels, a/b as fnui_input
+void SendDuiInput(const std::string& handle, int type, int button, int x, int y, int a, int b);
+// the host created its browser (IS_DUI_AVAILABLE)
+bool IsDuiAvailable(const std::string& handle);
+fwRefContainer<nui::GITexture> GetDuiTexture(const std::string& handle);
+// render thread, each frame: new DUI frames into their textures
+void RenderDuis();
 }

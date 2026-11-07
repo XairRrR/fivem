@@ -16,6 +16,7 @@
 
 #include "StdInc.h"
 #include "CefOverlay.h"
+#include "NativeNuiBridge.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -393,6 +394,12 @@ bool CopyLatestFrame(fnui_header* header, const nui::GILockedTexture& locked)
 
 void RenderNativeFrames()
 {
+	// DUI textures are used by the game's world: updated even when no NUI is drawn
+	if (nui::native::IsMenuActive())
+	{
+		nui::native::RenderDuis();
+	}
+
 	if (!g_native.tried)
 	{
 		g_native.tried = true;
@@ -460,6 +467,12 @@ void RenderNativeFrames()
 	g_nuiGi->DrawRectangles(1, &rr);
 	g_nuiGi->UnsetTexture();
 }
+}
+
+// NativeNuiBridge.cpp: DUI frames, same file format
+bool CopyNativeFrame(fnui_header* header, const nui::GILockedTexture& locked)
+{
+	return CopyLatestFrame(header, locked);
 }
 
 static HookFunction initFunction([]()

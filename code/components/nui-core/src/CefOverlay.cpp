@@ -494,11 +494,38 @@ namespace nui
 
 	DLL_EXPORT fwRefContainer<NUIWindow> CreateNUIWindow(fwString windowName, int width, int height, fwString windowURL, bool rawBlit)
 	{
+		// a DUI (CREATE_DUI): rendered by the native Linux host when it renders the main menu
+		if (windowName.rfind("nui_resource_", 0) == 0 && nui::native::CreateDui(windowName, width, height, windowURL))
+		{
+			return nullptr;
+		}
+
 		return CreateNUIWindow(windowName, width, height, windowURL, rawBlit, true);
+	}
+
+	OVERLAY_DECL bool IsNativeWindow(const std::string& windowName)
+	{
+		return nui::native::IsDui(windowName);
+	}
+
+	OVERLAY_DECL bool IsNativeWindowAvailable(const std::string& windowName)
+	{
+		return nui::native::IsDuiAvailable(windowName);
+	}
+
+	OVERLAY_DECL void SendNativeWindowInput(const std::string& windowName, int type, int button, int x, int y, int a, int b)
+	{
+		nui::native::SendDuiInput(windowName, type, button, x, y, a, b);
 	}
 
 	__declspec(dllexport) void DestroyNUIWindow(fwString windowName)
 	{
+		if (nui::native::IsDui(windowName))
+		{
+			nui::native::DestroyDui(windowName);
+			return;
+		}
+
 		std::unique_lock<std::shared_mutex> lock(windowListMutex);
 
 		auto windowIt = windowList.find(windowName);
@@ -524,6 +551,12 @@ namespace nui
 
 	__declspec(dllexport) void SetNUIWindowURL(fwString windowName, fwString url)
 	{
+		if (nui::native::IsDui(windowName))
+		{
+			nui::native::SetDuiUrl(windowName, url);
+			return;
+		}
+
 		fwRefContainer<NUIWindow> window = FindNUIWindow(windowName);
 
 		if (!window.GetRef())
@@ -539,6 +572,11 @@ namespace nui
 
 	OVERLAY_DECL fwRefContainer<nui::GITexture> GetWindowTexture(fwString windowName)
 	{
+		if (nui::native::IsDui(windowName))
+		{
+			return nui::native::GetDuiTexture(windowName);
+		}
+
 		fwRefContainer<NUIWindow> window = FindNUIWindow(windowName);
 
 		if (!window.GetRef())
@@ -551,6 +589,12 @@ namespace nui
 
 	__declspec(dllexport) void ExecuteWindowScript(const std::string& windowName, const std::string& scriptBit)
 	{
+		if (nui::native::IsDui(windowName))
+		{
+			nui::native::RunDuiScript(windowName, scriptBit);
+			return;
+		}
+
 		fwRefContainer<NUIWindow> window = FindNUIWindow(windowName);
 
 		if (!window.GetRef())

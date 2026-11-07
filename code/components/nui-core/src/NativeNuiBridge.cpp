@@ -19,6 +19,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <map>
@@ -60,6 +61,83 @@ struct Bridge
 };
 
 Bridge g_bridge;
+
+// DUI browsers of the host (nui::native::CreateDui)
+struct NativeDui
+{
+	int width = 0, height = 0;
+	fwRefContainer<nui::GITexture> texture;
+	fnui_header* header = nullptr;		// the host's frame file, once it created the browser
+	uint64_t lastSeq = 0;
+	bool logged = false;
+};
+
+std::mutex g_duiLock;
+std::map<std::string, std::shared_ptr<NativeDui>> g_duis;
+
+void UnmapDui(NativeDui& dui)
+{
+	if (dui.header)
+	{
+		UnmapViewOfFile(dui.header);
+		dui.header = nullptr;
+	}
+}
+
+// {"t":"dui-created","id","shm":"/dev/shm/...","width","height"}: the frame file, through Wine's Z:
+void OnDuiCreated(const json& message)
+{
+	std::string id = message.value("id", "");
+	std::string shm = message.value("shm", "");
+	std::wstring path = L"Z:" + ToWide(shm);
+	std::replace(path.begin(), path.end(), L'/', L'\\');
+
+	HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+	{
+		trace("Native NUI: DUI %s: cannot open %s (%d)\n", id, shm, GetLastError());
+		return;
+	}
+	HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+	CloseHandle(file);
+	auto header = mapping ? static_cast<fnui_header*>(MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0)) : nullptr;
+	if (mapping)
+	{
+		CloseHandle(mapping);
+	}
+	if (!header || header->magic != FNUI_MAGIC || header->version != FNUI_VERSION)
+	{
+		trace("Native NUI: DUI %s: %s is not a frame file\n", id, shm);
+		if (header)
+		{
+			UnmapViewOfFile(header);
+		}
+		return;
+	}
+
+	std::unique_lock _(g_duiLock);
+	auto it = g_duis.find(id);
+	if (it == g_duis.end())
+	{
+		UnmapViewOfFile(header);		// destroyed meanwhile
+		return;
+	}
+	UnmapDui(*it->second);
+	it->second->header = header;
+	it->second->lastSeq = 0;
+	trace("Native NUI: DUI %s rendered by the host (%dx%d)\n", id, header->max_width, header->max_height);
+}
+
+// the host's browser is gone (its renderer crashed): the texture keeps its last frame
+void OnDuiClosed(const json& message)
+{
+	std::unique_lock _(g_duiLock);
+	auto it = g_duis.find(message.value("id", ""));
+	if (it != g_duis.end())
+	{
+		UnmapDui(*it->second);
+	}
+}
 
 bool SendAll(SOCKET s, const char* data, size_t size)
 {
@@ -466,6 +544,14 @@ void Reader(SOCKET s)
 		{
 			SetCursorByName(message.value("name", ""));
 		}
+		else if (type == "dui-created")
+		{
+			OnDuiCreated(message);
+		}
+		else if (type == "dui-closed")
+		{
+			OnDuiClosed(message);
+		}
 		else if (type == "hello")
 		{
 			trace("Native NUI: host control channel ready (%dx%d)\n", message.value("width", 0), message.value("height", 0));
@@ -474,6 +560,13 @@ void Reader(SOCKET s)
 
 	trace("Native NUI: control channel closed\n");
 	g_bridge.active = false;
+
+	// the host closes the DUI browsers with the connection
+	std::unique_lock _(g_duiLock);
+	for (auto& [id, dui] : g_duis)
+	{
+		UnmapDui(*dui);
+	}
 }
 
 void Connect()
@@ -580,5 +673,125 @@ void RegisterFactory(const std::string& scheme, const std::string& domain, CefRe
 void Navigate(const std::string& url)
 {
 	Send(json{ { "t", "navigate" }, { "url", url } });
+}
+
+bool CreateDui(const std::string& handle, int width, int height, const std::string& url)
+{
+	if (!IsMenuActive())
+	{
+		return false;
+	}
+
+	auto dui = std::make_shared<NativeDui>();
+	dui->width = width;
+	dui->height = height;
+	// as NUIWindow::Initialize: the texture exists at once (scripts make a runtime texture of it
+	// right after CREATE_DUI), materialized on the render queue
+	dui->texture = g_nuiGi->CreateTextureBacking(width, height, nui::GITextureFormat::ARGB);
+
+	{
+		std::unique_lock _(g_duiLock);
+		if (auto it = g_duis.find(handle); it != g_duis.end())
+		{
+			UnmapDui(*it->second);
+		}
+		g_duis[handle] = dui;
+	}
+	Send(json{ { "t", "dui-create" }, { "id", handle }, { "url", url }, { "width", width }, { "height", height } });
+	return true;
+}
+
+bool IsDui(const std::string& handle)
+{
+	std::unique_lock _(g_duiLock);
+	return g_duis.find(handle) != g_duis.end();
+}
+
+void DestroyDui(const std::string& handle)
+{
+	{
+		std::unique_lock _(g_duiLock);
+		auto it = g_duis.find(handle);
+		if (it == g_duis.end())
+		{
+			return;
+		}
+		UnmapDui(*it->second);
+		g_duis.erase(it);
+	}
+	Send(json{ { "t", "dui-destroy" }, { "id", handle } });
+}
+
+void SetDuiUrl(const std::string& handle, const std::string& url)
+{
+	Send(json{ { "t", "dui-url" }, { "id", handle }, { "url", url } });
+}
+
+void RunDuiScript(const std::string& handle, const std::string& code)
+{
+	Send(json{ { "t", "dui-js" }, { "id", handle }, { "code", code } });
+}
+
+void SendDuiInput(const std::string& handle, int type, int button, int x, int y, int a, int b)
+{
+	Send(json{ { "t", "dui-input" }, { "id", handle }, { "type", type }, { "button", button }, { "x", x }, { "y", y },
+		{ "a", a }, { "b", b }, { "modifiers", 0 } });
+}
+
+bool IsDuiAvailable(const std::string& handle)
+{
+	std::unique_lock _(g_duiLock);
+	auto it = g_duis.find(handle);
+	return it != g_duis.end() && it->second->header;
+}
+
+fwRefContainer<nui::GITexture> GetDuiTexture(const std::string& handle)
+{
+	std::unique_lock _(g_duiLock);
+	auto it = g_duis.find(handle);
+	return it != g_duis.end() ? it->second->texture : nullptr;
+}
+}
+
+// NativeNui.cpp
+bool CopyNativeFrame(fnui_header* header, const nui::GILockedTexture& locked);
+
+namespace nui::native
+{
+void RenderDuis()
+{
+	std::unique_lock _(g_duiLock);
+
+	for (auto& [id, dui] : g_duis)
+	{
+		auto header = dui->header;
+		if (!header || !header->host_alive || header->front >= FNUI_BUFFERS || !dui->texture.GetRef() ||
+			!dui->texture->GetNativeTexture())
+		{
+			continue;
+		}
+
+		uint64_t seq = header->seq;
+		if (seq == dui->lastSeq)
+		{
+			continue;
+		}
+
+		nui::GILockedTexture locked = {};
+		if (dui->texture->Map(0, 0, &locked, nui::GILockFlags::WriteDiscard))
+		{
+			if (CopyNativeFrame(header, locked))
+			{
+				dui->lastSeq = seq;
+			}
+			dui->texture->Unmap(&locked);
+
+			if (!dui->logged)
+			{
+				dui->logged = true;
+				trace("Native NUI: DUI %s: first frame\n", id);
+			}
+		}
+	}
 }
 }

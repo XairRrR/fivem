@@ -253,6 +253,11 @@ static InitFunction initFunction([] ()
 
 		bool IsAvailable()
 		{
+			if (nui::IsNativeWindow(m_autogenHandle))
+			{
+				return nui::IsNativeWindowAvailable(m_autogenHandle);
+			}
+
 			auto browser = nui::GetNUIWindowBrowser(m_autogenHandle);
 
 			return browser && browser->GetHost();
@@ -270,6 +275,12 @@ static InitFunction initFunction([] ()
 			m_mouseX = x;
 			m_mouseY = y;
 
+			if (nui::IsNativeWindow(m_autogenHandle))
+			{
+				nui::SendNativeWindowInput(m_autogenHandle, 1, 0, x, y, 0, 0);
+				return;
+			}
+
 			if (browser && browser->GetHost())
 			{
 				CefMouseEvent ev;
@@ -282,6 +293,12 @@ static InitFunction initFunction([] ()
 
 		void InjectMouseDown(const char* button)
 		{
+			if (nui::IsNativeWindow(m_autogenHandle))
+			{
+				nui::SendNativeWindowInput(m_autogenHandle, 2, NativeButton(button), m_mouseX, m_mouseY, 1, 0);
+				return;
+			}
+
 			auto browser = nui::GetNUIWindowBrowser(m_autogenHandle);
 
 			if (browser && browser->GetHost())
@@ -296,6 +313,12 @@ static InitFunction initFunction([] ()
 
 		void InjectMouseUp(const char* button)
 		{
+			if (nui::IsNativeWindow(m_autogenHandle))
+			{
+				nui::SendNativeWindowInput(m_autogenHandle, 3, NativeButton(button), m_mouseX, m_mouseY, 1, 0);
+				return;
+			}
+
 			auto browser = nui::GetNUIWindowBrowser(m_autogenHandle);
 
 			if (browser && browser->GetHost())
@@ -310,6 +333,12 @@ static InitFunction initFunction([] ()
 
 		void InjectMouseWheel(int dy, int dx)
 		{
+			if (nui::IsNativeWindow(m_autogenHandle))
+			{
+				nui::SendNativeWindowInput(m_autogenHandle, 4, 0, m_mouseX, m_mouseY, dx, dy);
+				return;
+			}
+
 			auto browser = nui::GetNUIWindowBrowser(m_autogenHandle);
 
 			if (browser && browser->GetHost())
@@ -323,6 +352,13 @@ static InitFunction initFunction([] ()
 		}
 
 	private:
+		// the native host's button numbers (fnui_input: 0 left, 1 right, 2 middle)
+		int NativeButton(const char* button)
+		{
+			auto type = GetButton(button);
+			return type == MBT_RIGHT ? 1 : type == MBT_MIDDLE ? 2 : 0;
+		}
+
 		cef_mouse_button_type_t GetButton(const char* button)
 		{
 			if (_stricmp(button, "left") == 0)
