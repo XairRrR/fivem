@@ -79,9 +79,7 @@ int main(void)
     SetLastError( 0xdeadbeef );
     b = DeregisterEventSource( NULL ); err = GetLastError();
     printf( "DeregisterEventSource(NULL) %d err %lu\n", b, b ? 0 : err );
-    SetLastError( 0xdeadbeef );
-    b = DeregisterEventSource( (HANDLE)0x1234 ); err = GetLastError();
-    printf( "DeregisterEventSource(bogus) %d err %lu\n", b, b ? 0 : err );
+    /* DeregisterEventSource((HANDLE)0x1234) crashes on Windows (oracle run 42358171681) */
 
     GetTempPathW( MAX_PATH, tmp );
     swprintf( file, MAX_PATH, L"%swine-decrypt-%lu.txt", tmp, GetCurrentProcessId() );

@@ -1,6 +1,8 @@
-/* GetEffectiveRightsFromAclW (mono) : droits accordés par une ACL à un trustee, en tenant compte de ses
- * groupes ; les ACE sont prises dans l'ordre (la première qui nomme un droit décide), les ACE
- * « inherit only » ne s'appliquent pas. Wine renvoyait une erreur sans rien remplir. */
+/* GetEffectiveRightsFromAclW (mono) : droits accordés par une ACL à un trustee. Valeurs relevées sur
+ * Windows Server 2022 (tests/effrights-explore.c) : les ACE sont prises dans l'ordre (la première qui
+ * nomme un droit décide), l'ACL doit être canonique (ERROR_INVALID_ACL sinon), seuls comptent le
+ * trustee, Everyone et les groupes directs du compte (Administrators), pas Users ni les groupes de
+ * l'ouverture de session. Wine renvoyait une erreur sans rien remplir. */
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
@@ -74,12 +76,27 @@ int main(void)
     AddAccessAllowedAce( acl, ACL_REVISION, FILE_ALL_ACCESS, me );
     AddAccessDeniedAce( acl, ACL_REVISION, FILE_WRITE_DATA, me );
     mask = rights( acl, me, &ret );
-    CHECK( !ret && mask == FILE_ALL_ACCESS, "an allow before a deny wins (%#lx)", mask );
+    CHECK( ret == ERROR_INVALID_ACL && mask == 0xdeadbeef, "a deny after an allow is not canonical (%lu, %#lx)", ret, mask );
 
     acl = new_acl();
     AddAccessAllowedAce( acl, ACL_REVISION, FILE_GENERIC_EXECUTE, users );
     mask = rights( acl, me, &ret );
-    CHECK( !ret && mask == FILE_GENERIC_EXECUTE, "an ACE for BUILTIN\\Users applies to its member (%#lx)", mask );
+    CHECK( !ret && mask == 0, "an ACE for BUILTIN\\Users does not apply (%#lx)", mask );
+    {
+        PSID auth = sid_of( "S-1-5-11" ), admins = sid_of( "S-1-5-32-544" );
+        BOOL is_admin = FALSE;
+        acl = new_acl();
+        AddAccessAllowedAce( acl, ACL_REVISION, FILE_GENERIC_EXECUTE, auth );
+        mask = rights( acl, me, &ret );
+        CHECK( !ret && mask == 0, "nor one for Authenticated Users (%#lx)", mask );
+        CheckTokenMembership( NULL, admins, &is_admin );
+        acl = new_acl();
+        AddAccessAllowedAce( acl, ACL_REVISION, FILE_GENERIC_EXECUTE, admins );
+        mask = rights( acl, me, &ret );
+        CHECK( !ret && mask == (is_admin ? FILE_GENERIC_EXECUTE : 0), "one for Administrators applies to an administrator (%#lx, admin %d)",
+               mask, is_admin );
+        LocalFree( auth ); LocalFree( admins );
+    }
 
     acl = new_acl();
     AddAccessAllowedAceEx( acl, ACL_REVISION, INHERIT_ONLY_ACE | OBJECT_INHERIT_ACE, FILE_ALL_ACCESS, me );
