@@ -63,6 +63,12 @@ try {
         Invoke-RunMSBuild -Context $ctx -Tools $tools
     }.GetNewClosure()
 
+    # component build (linux-native fork, CFX_MSBUILD_PROJECTS): only the DLLs, no UI nor pack
+    if ($env:CFX_MSBUILD_PROJECTS) {
+        $ctx.finishBuild()
+        return
+    }
+
     Invoke-LogSection "Uploading symbols" {
         Invoke-UploadClientSymbols -Context $ctx -Tools $tools
     }.GetNewClosure()

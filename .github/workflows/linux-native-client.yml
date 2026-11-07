@@ -6,6 +6,11 @@ name: Build FiveM client (linux-native)
 
 on:
   workflow_dispatch:
+    inputs:
+      projects:
+        description: "Component build: only these projects (e.g. nui-core,citizen-resources-client) and their dependencies; the artifact holds their DLLs. Empty: the whole client."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -61,9 +66,34 @@ jobs:
         shell: pwsh
         env:
           npm_config_python: ${{ steps.python.outputs.python-path }}
+          CFX_MSBUILD_PROJECTS: ${{ inputs.projects }}
         run: .\code\tools\ci\build_client.ps1
 
+      # component build: the DLLs of the projects asked for, to drop into an installed client
+      - name: Package components
+        if: ${{ inputs.projects != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'components'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          $bin = '.build-cache\bin\five\release'
+          foreach ($p in ('${{ inputs.projects }}' -split '[,; ]+' | Where-Object { $_ })) {
+            Copy-Item (Join-Path $bin "$p.dll") $stage
+          }
+          Set-Content -NoNewline -Encoding ascii (Join-Path $stage 'linux-native-commit.txt') $env:GITHUB_SHA
+          Get-ChildItem $stage
+
+      - name: Upload components
+        if: ${{ inputs.projects != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fivem-client-components
+          path: ${{ runner.temp }}/components
+          retention-days: 14
+
       - name: Package for Wine/Proton
+        if: ${{ inputs.projects == '' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -82,6 +112,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "7z failed" }
 
       - name: Upload client
+        if: ${{ inputs.projects == '' }}
         uses: actions/upload-artifact@v4
         with:
           name: fivem-client-linux-native

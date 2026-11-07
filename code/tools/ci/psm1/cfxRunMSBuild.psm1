@@ -43,9 +43,22 @@ function Invoke-RunMSBuild {
         Start-Process powershell -ArgumentList "-ExecutionPolicy unrestricted $sogBefore" -NoNewWindow -Wait
     }
 
+    # CFX_MSBUILD_PROJECTS (linux-native fork): only these projects and what they depend on,
+    # instead of the whole solution (a component build, for quick iterations)
+    $inputs = @($Context.MSBuildSolution)
+    $projectArgs = @()
+    if ($env:CFX_MSBUILD_PROJECTS) {
+        $solutionDir = Split-Path -Parent $Context.MSBuildSolution
+        $inputs = @($env:CFX_MSBUILD_PROJECTS -split '[,; ]+' | Where-Object { $_ } | ForEach-Object { Join-Path $solutionDir "$_.vcxproj" })
+        $projectArgs = @("-p:Platform=x64", "-p:SolutionDir=$solutionDir\")
+        Write-Output "Building only: $($inputs -join ', ')"
+    }
+
     try {
+      foreach ($input in $inputs) {
         msbuild @(
-            $Context.MSBuildSolution
+            $input
+            $projectArgs
             "-m"        # Use all CPU cores
             "-v:q"      # Quiet verbosity level
             "-nr:False" # Don't keep MSBuild nodes alive
@@ -60,6 +73,7 @@ function Invoke-RunMSBuild {
         )
 
         Test-LastExitCode "MSBuild failed"
+      }
     }
     catch {
         $msbuildException = $_
