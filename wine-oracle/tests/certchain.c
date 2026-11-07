@@ -76,7 +76,8 @@ int main(void)
     para.pdwIssuerChainIndex = &chain_index;
     para.pdwIssuerElementIndex = &element_index;
     chain = find( store, 0, &para, NULL, &err );
-    CHECK( chain && !chain_index && !element_index, "its own issuer: found, chain %lu element %lu", chain_index, element_index );
+    /* Windows reports the index of the issuer: after the self-signed certificate itself */
+    CHECK( chain && !chain_index && element_index == 1, "its own issuer: found, chain %lu element %lu", chain_index, element_index );
     if (chain) CertFreeCertificateChain( chain );
 
     other.cbData = sizeof(other_buf);
@@ -105,7 +106,8 @@ int main(void)
     CertCloseStore( nokey, 0 );
 
     chain = find( store, 0, NULL, NULL, &err );
-    CHECK( !chain && err == CRYPT_E_NOT_FOUND, "NULL parameter: CRYPT_E_NOT_FOUND (%#lx)", err );
+    /* with a certificate to examine (an empty store gives CRYPT_E_NOT_FOUND, misc2-explore.c) */
+    CHECK( !chain && err == E_INVALIDARG, "NULL parameter: E_INVALIDARG (%#lx)", err );
 
     CertCloseStore( store, 0 );
     CertFreeCertificateContext( cert );
