@@ -1401,6 +1401,19 @@ std::string GetContext();
 
 void CreateRootWindow()
 {
+	// the native Linux host renders the root page, the resource frames and the main menu: no
+	// Windows CEF browser (nor its renderer and GPU processes) is created for it
+	if (nui::native::IsMenuActive())
+	{
+		static bool logged = false;
+		if (!logged)
+		{
+			logged = true;
+			trace("Native NUI: no CEF root window, the Linux host renders the NUI\n");
+		}
+		return;
+	}
+
 	int resX, resY;
 	g_nuiGi->GetGameResolution(&resX, &resY);
 

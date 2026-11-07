@@ -437,11 +437,35 @@ namespace nui
 		PostJSEvent("frameCall", { frame, jsonData });
 	}
 
+	// frames created by FiveM (name -> URL)
+	static std::unordered_map<std::string, std::string> frameList;
+	static std::shared_mutex frameListMutex;
+
 	__declspec(dllexport) void ReloadNUI()
 	{
+		// native host: reload its root page and create the frames again, as FiveM's root page
+		// does when it reloads (NUIClient: RecreateFrames)
+		if (nui::native::IsActive())
+		{
+			nui::native::Navigate("nui://game/ui/root.html");
+
+			std::shared_lock<std::shared_mutex> lock(frameListMutex);
+			for (const auto& [frameName, frameURL] : frameList)
+			{
+				if (frameName != "mpMenu" || nui::native::IsMenuActive())
+				{
+					nui::native::PostProcessMessage("", "createFrame", { frameName, frameURL });
+				}
+			}
+			return;
+		}
+
 		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
 
-		rootWindow->GetBrowser()->ReloadIgnoreCache();
+		if (rootWindow.GetRef() && rootWindow->GetBrowser())
+		{
+			rootWindow->GetBrowser()->ReloadIgnoreCache();
+		}
 	}
 
 	__declspec(dllexport) void SetMainUI(bool enable)
@@ -540,8 +564,6 @@ namespace nui
 		}
 	}
 
-	static std::unordered_map<std::string, std::string> frameList;
-	static std::shared_mutex frameListMutex;
 
 	static bool rootWindowTerminated;
 
@@ -696,8 +718,19 @@ namespace nui
 
 	__declspec(dllexport) void SignalPoll(fwString frameName)
 	{
-		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
 		std::string frame = frameName.c_str();
-		rootWindow->SignalPoll(frame);
+
+		// native host: the poll goes to its root page directly (no CEF root window in that mode)
+		if (nui::native::IsActive())
+		{
+			nui::native::PostProcessMessage("", "doPoll", { frame });
+			return;
+		}
+
+		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
+		if (rootWindow.GetRef())
+		{
+			rootWindow->SignalPoll(frame);
+		}
 	}
 }
