@@ -49,7 +49,10 @@ function Invoke-RunMSBuild {
     $projectArgs = @()
     if ($env:CFX_MSBUILD_PROJECTS) {
         $solutionDir = Split-Path -Parent $Context.MSBuildSolution
-        $inputs = @($env:CFX_MSBUILD_PROJECTS -split '[,; ]+' | Where-Object { $_ } | ForEach-Object { Join-Path $solutionDir "$_.vcxproj" })
+        # CitiCore first: it generates the IDL headers (fxcore.h...) other projects include without
+        # referencing it (the whole solution builds it early)
+        $names = @('CitiCore') + @($env:CFX_MSBUILD_PROJECTS -split '[,; ]+' | Where-Object { $_ -and $_ -ne 'CitiCore' })
+        $inputs = @($names | ForEach-Object { Join-Path $solutionDir "$_.vcxproj" })
         $projectArgs = @("-p:Platform=x64", "-p:SolutionDir=$solutionDir\")
         Write-Output "Building only: $($inputs -join ', ')"
     }
