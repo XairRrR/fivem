@@ -217,6 +217,14 @@ private:
 
 	std::shared_ptr<Botan::TLS::Client> m_tlsClient;
 
+	// The native Linux voice transport (wine-fivem fivem-voice), when the native launcher started
+	// FiveM (CitizenFX_NativeVoice): TLS and the UDP channel outside Wine, plain Mumble messages here
+	bool m_proxy = false;
+	bool m_proxyReady = false;
+	std::string m_proxyIn;
+
+	void HandleProxyData(const char* data, size_t length);
+
 	std::unique_ptr<Botan::TLS::Session_Manager_In_Memory> m_sessionManager;
 
 	MumbleClientState m_state;

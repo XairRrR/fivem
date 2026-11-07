@@ -90,6 +90,31 @@ void MumbleClient::Initialize()
 
 				m_connectionInfo.isConnecting = false;
 
+				// the native transport: which server, then plain Mumble messages once it says ready
+				if (m_proxy)
+				{
+					m_tcp->read();
+
+					char token[128];
+					DWORD tokenLength = GetEnvironmentVariableA("CitizenFX_NativeHelperToken", token, sizeof(token));
+					nlohmann::json hello = { { "server", m_connectionInfo.address.ToString() } };
+					if (tokenLength && tokenLength < sizeof(token))
+					{
+						hello["token"] = std::string(token, tokenLength);
+					}
+					std::string text = hello.dump();
+					uint16_t length = uint16_t(text.size());
+					std::string packet = "FVOX";
+					packet.append((const char*)&length, 2);
+					packet += text;
+					WriteToSocket((const uint8_t*)packet.data(), packet.size());
+
+					m_timeSinceJoin = msec();
+					m_inFlightTcpPings = 0;
+					m_connectionInfo.isConnected = true;
+					return;
+				}
+
 				try
 				{
 					m_sessionManager = std::make_unique<Botan::TLS::Session_Manager_In_Memory>(m_rng);
@@ -123,6 +148,7 @@ void MumbleClient::Initialize()
 			{
 				console::DPrintf("Mumble", "connecting failed: %s\n", ev.what());
 
+				m_proxyReady = false;
 				m_connectionInfo.isConnecting = false;
 				m_idleTimer->start(2s, 500ms);
 
@@ -134,6 +160,7 @@ void MumbleClient::Initialize()
 				// TCP close, graceful?
 				console::DPrintf("Mumble", "TCP close.\n");
 
+				m_proxyReady = false;
 				m_connectionInfo.isConnecting = false;
 				m_idleTimer->start(2s, 500ms);
 
@@ -147,7 +174,14 @@ void MumbleClient::Initialize()
 					if (ev.length > 0)
 					{
 						std::unique_lock lock(m_clientMutex);
-						m_tlsClient->received_data(reinterpret_cast<uint8_t*>(ev.data.get()), ev.length);
+						if (m_proxy)
+						{
+							HandleProxyData(ev.data.get(), ev.length);
+						}
+						else
+						{
+							m_tlsClient->received_data(reinterpret_cast<uint8_t*>(ev.data.get()), ev.length);
+						}
 					}
 				}
 				catch (std::exception& e)
@@ -157,7 +191,24 @@ void MumbleClient::Initialize()
 			});
 
 			const auto& address = m_connectionInfo.address;
-			m_tcp->connect(*address.GetSocketAddress());
+
+			// the native Linux transport when the launcher started one, else the server itself
+			char nativeVoice[64];
+			DWORD nativeLength = GetEnvironmentVariableA("CitizenFX_NativeVoice", nativeVoice, sizeof(nativeVoice));
+			std::string proxy = nativeLength && nativeLength < sizeof(nativeVoice) ? std::string(nativeVoice, nativeLength) : std::string();
+			auto proxyColon = proxy.rfind(':');
+			m_proxy = proxyColon != std::string::npos;
+			m_proxyReady = false;
+			m_proxyIn.clear();
+
+			if (m_proxy)
+			{
+				m_tcp->connect(proxy.substr(0, proxyColon), atoi(proxy.c_str() + proxyColon + 1));
+			}
+			else
+			{
+				m_tcp->connect(*address.GetSocketAddress());
+			}
 			m_state.Reset();
 			m_state.SetClient(this);
 			m_state.SetUsername(m_connectionInfo.username);
@@ -169,7 +220,7 @@ void MumbleClient::Initialize()
 			auto lockedIsActive = [this]()
 			{
 				std::unique_lock _(m_clientMutex);
-				bool active = m_tlsClient && m_tlsClient->is_active() && m_connectionInfo.isConnected;
+				bool active = (m_proxy ? m_proxyReady : (m_tlsClient && m_tlsClient->is_active())) && m_connectionInfo.isConnected;
 
 				return std::make_tuple(std::move(_), active);
 			};
@@ -438,7 +489,7 @@ concurrency::task<void> MumbleClient::DisconnectAsync()
 	{
 		std::unique_lock lock(m_clientMutex);
 
-		if (m_tlsClient)
+		if (m_tlsClient && !m_proxy)
 		{
 			m_tlsClient->close();
 		}
@@ -712,8 +763,9 @@ void MumbleClient::SetListenerMatrix(float position[3], float front[3], float up
 
 void MumbleClient::SendVoice(const char* buf, size_t size)
 {
-	// If we don't have UDP then we should send the packets over a TCP tunnel
-	if (!m_hasUdp)
+	// If we don't have UDP then we should send the packets over a TCP tunnel; the native transport
+	// takes them that way and chooses UDP itself
+	if (!m_hasUdp || m_proxy)
 	{
 		Send(MumbleMessageType::UDPTunnel, buf, size);
 		return;
@@ -1054,10 +1106,54 @@ void MumbleClient::Send(const char* buf, size_t size)
 
 	std::unique_lock lock(m_clientMutex);
 
+	if (m_proxy)
+	{
+		if (m_proxyReady)
+		{
+			WriteToSocket((const uint8_t*)buf, size);
+		}
+		return;
+	}
+
 	if (m_tlsClient->is_active())
 	{
 		m_tlsClient->send((const uint8_t*)buf, size);
 	}
+}
+
+// The native transport's stream: its ready frame (type 0xFFFF) stands for the TLS session becoming
+// active; then the server's messages, given to the handler in whole frames (it drops a header split
+// across two deliveries, which TLS records never do)
+void MumbleClient::HandleProxyData(const char* data, size_t length)
+{
+	m_proxyIn.append(data, length);
+
+	size_t used = 0;
+	while (m_proxyIn.size() - used >= 6)
+	{
+		const uint8_t* p = (const uint8_t*)m_proxyIn.data() + used;
+		uint16_t type = (p[0] << 8) | p[1];
+		uint32_t frameLength = (uint32_t(p[2]) << 24) | (uint32_t(p[3]) << 16) | (uint32_t(p[4]) << 8) | p[5];
+		if (m_proxyIn.size() - used < 6 + size_t(frameLength))
+		{
+			break;
+		}
+
+		if (type == 0xFFFF)
+		{
+			m_proxyReady = true;
+			used += 6;
+			OnActivated();
+			continue;
+		}
+
+		if (m_proxyReady)
+		{
+			OnReceive(p, 6 + frameLength);
+		}
+		used += 6 + frameLength;
+	}
+	m_proxyIn.erase(0, used);
 }
 
 void MumbleClient::WriteToSocket(const uint8_t buf[], size_t length)
