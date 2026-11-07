@@ -126,6 +126,12 @@ private:
 
 	inline void SetInputFormat(WAVEFORMATEX* waveFormat) { m_waveFormat = *waveFormat; }
 
+	void SetupProcessing(WAVEFORMATEX* waveFormat);
+
+	void ApplySettings(MumbleVoiceLikelihood& lastLikelihood);
+
+	bool RunNativeCapture();
+
 public:
 	MumbleAudioInput();
 

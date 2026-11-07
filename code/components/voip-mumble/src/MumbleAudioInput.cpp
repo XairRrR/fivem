@@ -6,6 +6,11 @@
  */
 
 #include "StdInc.h"
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib")
 #include "MumbleAudioInput.h"
 #include <avrt.h>
 #include <sstream>
@@ -108,6 +113,9 @@ void MumbleAudioInput::ThreadFunc()
 
 	// initialize COM for the current thread
 	CoInitialize(nullptr);
+
+	// the native Linux helper's microphone, when there is one (returns when it stops)
+	RunNativeCapture();
 
 	InitializeAudioDevice();
 
@@ -654,6 +662,35 @@ void MumbleAudioInput::InitializeAudioDevice()
 		return;
 	}
 
+	SetupProcessing(waveFormat);
+
+	// set event handle
+	m_audioClient->SetEventHandle(m_startEvent);
+
+	trace(__FUNCTION__ ": Initialized audio capture device.\n");
+}
+
+// Resampling to 48 kHz mono, webrtc processing and the Opus encoder, for a capture format (WASAPI's
+// mix format, or the native microphone's)
+void MumbleAudioInput::SetupProcessing(WAVEFORMATEX* waveFormat)
+{
+	if (m_avr)
+	{
+		swr_free(&m_avr);
+	}
+
+	if (m_apm)
+	{
+		delete m_apm;
+		m_apm = nullptr;
+	}
+
+	if (m_opus)
+	{
+		opus_encoder_destroy(m_opus);
+		m_opus = nullptr;
+	}
+
 	WAVEFORMATEXTENSIBLE* formatEx = (WAVEFORMATEXTENSIBLE*)waveFormat;
 
 	SetInputFormat(waveFormat);
@@ -700,9 +737,6 @@ void MumbleAudioInput::InitializeAudioDevice()
 	opus_encoder_ctl(m_opus, OPUS_SET_VBR(0));
 	opus_encoder_ctl(m_opus, OPUS_SET_BITRATE(48000));
 
-	// set event handle
-	m_audioClient->SetEventHandle(m_startEvent);
-
 	webrtc::Config config;
 	config.Set < webrtc::ExtendedFilter >
 		(new webrtc::ExtendedFilter(true));
@@ -744,7 +778,156 @@ void MumbleAudioInput::InitializeAudioDevice()
 	//m_apm->gain_control()->enable_limiter(true);
 	m_apm->gain_control()->Enable(true);
 
-	trace(__FUNCTION__ ": Initialized audio capture device.\n");
+}
+
+// The processing settings the game changes while capturing (voice likelihood, speech or music)
+void MumbleAudioInput::ApplySettings(MumbleVoiceLikelihood& lastLikelihood)
+{
+	if (m_likelihood != lastLikelihood)
+	{
+		if (m_apm)
+		{
+			m_apm->voice_detection()->set_likelihood(ConvertLikelihood(m_likelihood));
+		}
+
+		lastLikelihood = m_likelihood;
+	}
+
+	if (g_curInputIntentMode != g_lastIntentMode)
+	{
+		if (m_apm)
+		{
+			bool speech = g_curInputIntentMode != InputIntentMode::MUSIC;
+			m_apm->noise_suppression()->Enable(speech);
+			m_apm->high_pass_filter()->Enable(speech);
+		}
+
+		g_lastIntentMode = g_curInputIntentMode;
+	}
+}
+
+// The microphone captured outside Wine by the native Linux helper (wine-fivem fivem-helper, "mic":
+// PipeWire/PulseAudio's default source, 16-bit mono 48 kHz in 10 ms chunks) when the native launcher
+// started FiveM: the same processing and encoding as WASAPI's data. false when the helper cannot
+// be reached (then WASAPI); when its capture stops, WASAPI takes over too.
+bool MumbleAudioInput::RunNativeCapture()
+{
+	char address[64];
+	DWORD length = GetEnvironmentVariableA("CitizenFX_NativeHelper", address, sizeof(address));
+	if (!length || length >= sizeof(address))
+	{
+		return false;
+	}
+	std::string value = address;
+	auto colon = value.rfind(':');
+	if (colon == std::string::npos)
+	{
+		return false;
+	}
+
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	sockaddr_in addr = {};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(uint16_t(atoi(value.c_str() + colon + 1)));
+	inet_pton(AF_INET, value.substr(0, colon).c_str(), &addr.sin_addr);
+	if (s == INVALID_SOCKET || connect(s, (sockaddr*)&addr, sizeof(addr)) != 0)
+	{
+		trace("Native voice: cannot reach the helper (%d), capturing with WASAPI\n", WSAGetLastError());
+		if (s != INVALID_SOCKET)
+		{
+			closesocket(s);
+		}
+		return false;
+	}
+	BOOL noDelay = TRUE;
+	setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
+
+	auto sendJson = [s](const std::string& text)
+	{
+		uint32_t sizes[2] = { uint32_t(text.size()), 0 };
+		return send(s, (const char*)sizes, sizeof(sizes), 0) == sizeof(sizes) && send(s, text.data(), int(text.size()), 0) == int(text.size());
+	};
+	auto recvAll = [s](char* data, size_t size)
+	{
+		while (size)
+		{
+			int n = recv(s, data, int(size), 0);
+			if (n <= 0)
+			{
+				return false;
+			}
+			data += n;
+			size -= n;
+		}
+		return true;
+	};
+
+	char token[128];
+	length = GetEnvironmentVariableA("CitizenFX_NativeHelperToken", token, sizeof(token));
+	if (length && length < sizeof(token))
+	{
+		sendJson(R"({"t":"auth","token":")" + std::string(token, length) + R"("})");
+	}
+
+	// the format of the helper's chunks
+	WAVEFORMATEX format = {};
+	format.wFormatTag = WAVE_FORMAT_PCM;
+	format.nChannels = 1;
+	format.nSamplesPerSec = 48000;
+	format.wBitsPerSample = 16;
+	format.nBlockAlign = 2;
+	format.nAvgBytesPerSec = 48000 * 2;
+	SetInputFormat(&format);
+	SetupProcessing(&format);
+	trace("Native voice: the microphone is captured by the native helper\n");
+
+	// wait for the activation signal, as the WASAPI path
+	WaitForSingleObject(m_startEvent, INFINITE);
+
+	if (!sendJson(R"({"t":"mic","id":1,"rate":48000})"))
+	{
+		closesocket(s);
+		SetEvent(m_startEvent);
+		return false;
+	}
+
+	MumbleVoiceLikelihood lastLikelihood = m_likelihood;
+	std::string text, body;
+	std::string why = "connection closed";
+	for (;;)
+	{
+		uint32_t sizes[2];
+		if (!recvAll((char*)sizes, sizeof(sizes)) || sizes[0] > 65536 || sizes[1] > (1 << 20))
+		{
+			break;
+		}
+		text.resize(sizes[0]);
+		body.resize(sizes[1]);
+		if (!recvAll(text.data(), text.size()) || !recvAll(body.data(), body.size()))
+		{
+			break;
+		}
+
+		if (text.find(R"("t":"mic-data")") != std::string::npos)
+		{
+			ApplySettings(lastLikelihood);
+			HandleData(reinterpret_cast<const uint8_t*>(body.data()), body.size());
+		}
+		else if (text.find(R"("t":"mic-end")") != std::string::npos)
+		{
+			why = text;
+			break;
+		}
+	}
+
+	closesocket(s);
+	trace("Native voice: the helper's capture stopped (%s), capturing with WASAPI\n", why);
+
+	// the WASAPI path waits for the activation once more
+	SetEvent(m_startEvent);
+	return false;
 }
 
 void MumbleAudioInput::Enable()
