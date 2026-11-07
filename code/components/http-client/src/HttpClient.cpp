@@ -8,6 +8,18 @@
 #include "StdInc.h"
 #include "HttpClient.h"
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <thread>
+
+#include <json.hpp>
+
+#pragma comment(lib, "ws2_32.lib")
+
 #include <chrono>
 
 #include <boost/algorithm/string.hpp>
@@ -90,6 +102,17 @@ public:
 
 	bool addErrorBody = false;
 	bool addRawBody = false;
+
+	// what the native Linux helper needs to make the same request (the curl handle's options)
+	std::map<std::string, std::string> headers;
+	std::string method;			// CURLOPT_CUSTOMREQUEST, empty for none
+	bool post = false;			// CURLOPT_POSTFIELDS set (postData)
+	bool followLocation = true;
+	bool ipv4 = false;
+	// a request made by the helper (native_http below): its id, its status, whether it completed
+	uint64_t nativeId = 0;
+	long nativeStatus = 0;
+	bool nativeFinished = false;
 
 	CurlData();
 
@@ -528,6 +551,9 @@ static std::shared_ptr<CurlData> SetupCURLHandle(const std::unique_ptr<HttpClien
 	curlData->addErrorBody = options.addErrorBody;
 	curlData->addRawBody = options.addRawBody;
 	curlData->maxFilesize = options.maxFilesize;
+	curlData->headers = options.headers;
+	curlData->followLocation = options.followLocation;
+	curlData->ipv4 = options.ipv4;
 
 	auto scb = options.streamingCallback;
 
@@ -589,6 +615,415 @@ static std::shared_ptr<CurlData> SetupCURLHandle(const std::unique_ptr<HttpClien
 	return curlData;
 }
 
+// FiveM's HTTP through the native Linux helper (wine-fivem fivem-helper, "req" transfers) when FiveM
+// runs under Wine from the native launcher (CitizenFX_NativeHelper=127.0.0.1:port, and the
+// launcher's token in CitizenFX_NativeHelperToken): the system libcurl outside Wine makes the
+// request with the options of the curl handle HttpClient prepared, and streams the response back;
+// its headers, body and result reach the request's callbacks on HttpClient's loop, as they would
+// from curl. Without the variable, or when the helper cannot be reached, requests use curl here.
+namespace native_http
+{
+using json = nlohmann::json;
+
+struct Helper
+{
+	std::once_flag init;
+	std::atomic<bool> active = false;
+	SOCKET sock = INVALID_SOCKET;
+	std::mutex sendLock;
+	std::mutex lock;
+	std::map<uint64_t, std::shared_ptr<CurlData>> requests;
+	std::atomic<uint64_t> nextId = 1;
+};
+
+static Helper g_helper;
+
+static bool SendAll(SOCKET s, const char* data, size_t size)
+{
+	while (size)
+	{
+		int n = send(s, data, int(std::min<size_t>(size, 1 << 20)), 0);
+		if (n <= 0)
+		{
+			return false;
+		}
+		data += n;
+		size -= n;
+	}
+	return true;
+}
+
+static bool RecvAll(SOCKET s, char* data, size_t size)
+{
+	while (size)
+	{
+		int n = recv(s, data, int(std::min<size_t>(size, 1 << 20)), 0);
+		if (n <= 0)
+		{
+			return false;
+		}
+		data += n;
+		size -= n;
+	}
+	return true;
+}
+
+static bool Send(const json& message, const std::string& body = {})
+{
+	std::string text = message.dump(-1, ' ', false, json::error_handler_t::replace);
+	uint32_t sizes[2] = { uint32_t(text.size()), uint32_t(body.size()) };
+
+	std::unique_lock _(g_helper.sendLock);
+	if (!g_helper.active)
+	{
+		return false;
+	}
+	if (!SendAll(g_helper.sock, (const char*)sizes, sizeof(sizes)) || !SendAll(g_helper.sock, text.data(), text.size()) ||
+		(!body.empty() && !SendAll(g_helper.sock, body.data(), body.size())))
+	{
+		trace("Native HTTP: helper connection lost\n");
+		g_helper.active = false;
+		return false;
+	}
+	return true;
+}
+
+// runs on the request's HttpClient loop, after what was queued before (keeps the helper's order)
+static void PostToLoop(HttpClientImpl* impl, std::function<void()>&& fn)
+{
+	impl->cbsToRun.push(std::move(fn));
+
+	std::shared_lock<std::shared_mutex> _(impl->mutex);
+	if (impl->runCb)
+	{
+		impl->runCb->send();
+	}
+}
+
+// as CurlData::HandleResult, with the helper's result; then the unused curl handle is released
+static void Finish(const std::shared_ptr<CurlData>& cd, int curlCode, long status, const std::string& error)
+{
+	if (cd->nativeFinished)
+	{
+		return;
+	}
+	cd->nativeFinished = true;
+
+	if (cd->preCallback)
+	{
+		cd->preCallback();
+		cd->preCallback = {};
+	}
+
+	if (cd->callback)
+	{
+		if (curlCode != 0)
+		{
+			cd->callback(false, error);
+		}
+		else
+		{
+			if (cd->responseCode)
+			{
+				*cd->responseCode = int(status);
+			}
+
+			if (status >= 400)
+			{
+				auto failure = fmt::sprintf("HTTP %d%s", status, cd->addErrorBody ? fmt::sprintf(": %s", cd->errorBody.str()) : "");
+				cd->callback(false, failure);
+			}
+			else
+			{
+				auto str = cd->ss.str();
+				cd->callback(true, str);
+			}
+		}
+
+		cd->callback = {};
+	}
+
+	if (cd->curlHandle)
+	{
+		FinalizeCurlHandle(cd->curlHandle);
+	}
+}
+
+// as CurlData::HandleWrite
+static bool Write(const std::shared_ptr<CurlData>& cd, const std::string& data)
+{
+	if (cd->addErrorBody && cd->nativeStatus >= 400)
+	{
+		cd->errorBody << data;
+	}
+
+	if (cd->addRawBody)
+	{
+		cd->rawBody << data;
+	}
+
+	return cd->writeFunction(data.data(), data.size()) == data.size();
+}
+
+static std::shared_ptr<CurlData> Take(uint64_t id, bool remove)
+{
+	std::unique_lock _(g_helper.lock);
+	auto it = g_helper.requests.find(id);
+	if (it == g_helper.requests.end())
+	{
+		return {};
+	}
+	auto cd = it->second;
+	if (remove)
+	{
+		g_helper.requests.erase(it);
+	}
+	return cd;
+}
+
+static void FailAll(const std::string& why)
+{
+	std::map<uint64_t, std::shared_ptr<CurlData>> requests;
+	{
+		std::unique_lock _(g_helper.lock);
+		requests.swap(g_helper.requests);
+	}
+	for (auto& [id, cd] : requests)
+	{
+		PostToLoop(cd->impl, [cd, why]()
+		{
+			Finish(cd, CURLE_COULDNT_CONNECT, 0, why);
+		});
+	}
+}
+
+static void Reader(SOCKET s)
+{
+	SetThreadName(-1, "NativeHttp");
+
+	for (;;)
+	{
+		uint32_t sizes[2];
+		if (!RecvAll(s, (char*)sizes, sizeof(sizes)))
+		{
+			break;
+		}
+		std::string text(sizes[0], '\0'), body(sizes[1], '\0');
+		if (!RecvAll(s, text.data(), text.size()) || !RecvAll(s, body.data(), body.size()))
+		{
+			break;
+		}
+
+		json message = json::parse(text, nullptr, false);
+		if (message.is_discarded() || !message.is_object())
+		{
+			continue;
+		}
+
+		std::string type = message.value("t", "");
+		uint64_t id = message.value("id", uint64_t(0));
+
+		if (type == "hello")
+		{
+			continue;
+		}
+
+		auto cd = Take(id, type == "done");
+		if (!cd)
+		{
+			continue;		// cancelled, or finished here (a write failure)
+		}
+
+		if (type == "head")
+		{
+			PostToLoop(cd->impl, [cd, message]()
+			{
+				cd->nativeStatus = message.value("status", 0L);
+
+				// as CurlHeaderInfo: the final response's headers
+				if (cd->responseHeaders)
+				{
+					cd->responseHeaders->clear();
+					for (const auto& header : message.value("headers", json::array()))
+					{
+						if (header.is_array() && header.size() == 2)
+						{
+							cd->responseHeaders->emplace(header[0].get<std::string>(), header[1].get<std::string>());
+						}
+					}
+				}
+			});
+		}
+		else if (type == "data")
+		{
+			PostToLoop(cd->impl, [cd, data = std::move(body)]()
+			{
+				if (cd->nativeFinished)
+				{
+					return;
+				}
+				if (!Write(cd, data))
+				{
+					// as curl when the write function takes less than it is given
+					{
+						std::unique_lock _(g_helper.lock);
+						g_helper.requests.erase(cd->nativeId);
+					}
+					Send(json{ { "t", "cancel" }, { "id", cd->nativeId } });
+					Finish(cd, CURLE_WRITE_ERROR, cd->nativeStatus,
+						"Failure writing output to destination - CURL error code 23 (Failure writing output to destination)");
+				}
+			});
+		}
+		else if (type == "progress")
+		{
+			PostToLoop(cd->impl, [cd, now = message.value("now", uint64_t(0)), total = message.value("total", uint64_t(0))]()
+			{
+				if (cd->progressCallback && !cd->nativeFinished)
+				{
+					ProgressInfo info;
+					info.downloadNow = now;
+					info.downloadTotal = total;
+					cd->progressCallback(info);
+				}
+			});
+		}
+		else if (type == "done")
+		{
+			PostToLoop(cd->impl, [cd, curlCode = message.value("curl", 0), status = message.value("status", 0L),
+								  error = message.value("error", std::string())]()
+			{
+				Finish(cd, curlCode, status, error);
+			});
+		}
+	}
+
+	trace("Native HTTP: helper connection closed\n");
+	g_helper.active = false;
+	FailAll("native HTTP helper disconnected - CURL error code 7 (Couldn't connect to server)");
+}
+
+static void Connect()
+{
+	char value[64];
+	DWORD length = GetEnvironmentVariableA("CitizenFX_NativeHelper", value, sizeof(value));
+	if (!length || length >= sizeof(value))
+	{
+		return;
+	}
+
+	std::string address = value;
+	auto colon = address.rfind(':');
+	if (colon == std::string::npos)
+	{
+		return;
+	}
+
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	sockaddr_in addr = {};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(uint16_t(atoi(address.c_str() + colon + 1)));
+	inet_pton(AF_INET, address.substr(0, colon).c_str(), &addr.sin_addr);
+	if (s == INVALID_SOCKET || connect(s, (sockaddr*)&addr, sizeof(addr)) != 0)
+	{
+		trace("Native HTTP: cannot connect to the helper at %s (%d), using curl here\n", address, WSAGetLastError());
+		if (s != INVALID_SOCKET)
+		{
+			closesocket(s);
+		}
+		return;
+	}
+	BOOL noDelay = TRUE;
+	setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
+
+	g_helper.sock = s;
+	g_helper.active = true;
+
+	char token[128];
+	length = GetEnvironmentVariableA("CitizenFX_NativeHelperToken", token, sizeof(token));
+	if (length && length < sizeof(token))
+	{
+		Send(json{ { "t", "auth" }, { "token", std::string(token, length) } });
+	}
+
+	std::thread(Reader, s).detach();
+	trace("Native HTTP: helper connected at %s\n", address);
+}
+
+// true: the helper makes the request (its answers drive cd's callbacks)
+static bool Submit(const std::shared_ptr<CurlData>& cd, const std::string& userAgent)
+{
+	if (!GetEnvironmentVariableA("CitizenFX_NativeHelper", nullptr, 0))
+	{
+		return false;
+	}
+
+	std::call_once(g_helper.init, Connect);
+	if (!g_helper.active)
+	{
+		return false;
+	}
+
+	uint64_t id = g_helper.nextId++;
+	cd->nativeId = id;
+	{
+		std::unique_lock _(g_helper.lock);
+		g_helper.requests[id] = cd;
+	}
+
+	json headers = json::object();
+	for (const auto& [key, value] : cd->headers)
+	{
+		headers[key] = value;
+	}
+
+	json request = {
+		{ "t", "req" }, { "id", id }, { "url", cd->url }, { "method", cd->method }, { "post", cd->post },
+		{ "headers", headers }, { "user_agent", userAgent }, { "follow", cd->followLocation }, { "ipv4", cd->ipv4 },
+		{ "max_size", cd->maxFilesize }, { "timeout_ms", int64_t(cd->timeoutNoResponse.count()) },
+		{ "weight", cd->weight }, { "progress", bool(cd->progressCallback) }
+	};
+
+	if (!Send(request, cd->post ? cd->postData : std::string()))
+	{
+		std::unique_lock _(g_helper.lock);
+		g_helper.requests.erase(id);
+		cd->nativeId = 0;
+		return false;
+	}
+	return true;
+}
+
+static void Cancel(const std::shared_ptr<CurlData>& cd)
+{
+	if (!Take(cd->nativeId, true))
+	{
+		return;
+	}
+	Send(json{ { "t", "cancel" }, { "id", cd->nativeId } });
+
+	// as Abort with curl: no callback, the handle is released
+	PostToLoop(cd->impl, [cd]()
+	{
+		if (!cd->nativeFinished)
+		{
+			cd->nativeFinished = true;
+			if (cd->curlHandle)
+			{
+				FinalizeCurlHandle(cd->curlHandle);
+			}
+		}
+	});
+}
+
+static void SetWeight(const std::shared_ptr<CurlData>& cd, int weight)
+{
+	Send(json{ { "t", "weight" }, { "id", cd->nativeId }, { "weight", weight } });
+}
+}
+
 class HttpRequestHandleImpl final : public ManualHttpRequestHandle
 {
 public:
@@ -628,6 +1063,12 @@ public:
 		auto request = m_request;
 		request->weight = newWeight;
 
+		if (request->nativeId)
+		{
+			native_http::SetWeight(request, newWeight);
+			return;
+		}
+
 		request->impl->cbsToRun.push([request, newWeight]()
 		{
 			if (request->curlHandle)
@@ -646,6 +1087,12 @@ public:
 	virtual void Abort() override
 	{
 		auto request = m_request;
+
+		if (request->nativeId)
+		{
+			native_http::Cancel(request);
+			return;
+		}
 
 		request->impl->cbsToRun.push([request]()
 		{
@@ -673,8 +1120,14 @@ public:
 
 	virtual void Start() override
 	{
-		m_request->impl->AddCurlHandle(m_request->curlHandle);
 		m_started = true;
+
+		if (native_http::Submit(m_request, m_request->impl->userAgent))
+		{
+			return;
+		}
+
+		m_request->impl->AddCurlHandle(m_request->curlHandle);
 	}
 
 	virtual void OnCompletion(std::function<void(bool, std::string_view)>&& callback) override
@@ -772,6 +1225,7 @@ HttpRequestPtr HttpClient::DoPostRequest(const std::string& url, const std::stri
 
 	// assign post data
 	curlData->postData = postData;
+	curlData->post = true;
 
 	curl_easy_setopt(curlData->curlHandle, CURLOPT_POSTFIELDS, curlData->postData.c_str());
 
@@ -797,11 +1251,13 @@ HttpRequestPtr HttpClient::DoMethodRequest(const std::string& method, const std:
 	{
 		// assign post data
 		curlData->postData = postData;
+		curlData->post = true;
 
 		curl_easy_setopt(curlData->curlHandle, CURLOPT_POSTFIELDS, curlData->postData.c_str());
 	}
 
 	curl_easy_setopt(curlData->curlHandle, CURLOPT_CUSTOMREQUEST, method.c_str());
+	curlData->method = method;
 
 	// write out
 	auto requestHandle = SetupRequestHandle(curlData);

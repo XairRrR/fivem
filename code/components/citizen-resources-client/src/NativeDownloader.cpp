@@ -271,6 +271,15 @@ void Connect()
 
 	g_helper.sock = s;
 	g_helper.active = true;
+
+	// the launcher's token (the helper refuses clients without it)
+	char token[128];
+	length = GetEnvironmentVariableA("CitizenFX_NativeHelperToken", token, sizeof(token));
+	if (length && length < sizeof(token))
+	{
+		Send(json{ { "t", "auth" }, { "token", std::string(token, length) } });
+	}
+
 	std::thread(Reader, s).detach();
 	trace("Native downloads: helper connected at %s\n", address);
 }
