@@ -26,6 +26,7 @@
 #include <wrl.h>
 
 #include <mutex>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -446,6 +447,68 @@ RECT ChangedSince(fnui_header* header, uint64_t lastSeq, uint64_t seq, uint32_t 
 	return changed;
 }
 
+// The rectangles frames (lastSeq, seq] changed (header dirty_rects ring), merged down to a few:
+// false when the host does not give them or an entry is missing (then ChangedSince decides)
+bool ChangedRects(fnui_header* header, uint64_t lastSeq, uint64_t seq, uint32_t width, uint32_t height, std::vector<RECT>& out)
+{
+	out.clear();
+	if (!lastSeq || header->rects_ring != FNUI_RECTS_RING || seq - lastSeq >= FNUI_RECTS_RING)
+	{
+		return false;
+	}
+
+	RECT bounds = { 0, 0, LONG(width), LONG(height) };
+	for (uint64_t s = lastSeq + 1; s <= seq; s++)
+	{
+		const volatile fnui_rects& entry = header->dirty_rects[s % FNUI_RECTS_RING];
+		if (uint64_t(InterlockedCompareExchange64((volatile LONG64*)&entry.seq, 0, 0)) != s)
+		{
+			return false;
+		}
+
+		uint32_t count = std::min<uint32_t>(entry.count, FNUI_RECTS_MAX);
+		for (uint32_t i = 0; i < count; i++)
+		{
+			const int32_t x = entry.rects[i].x, y = entry.rects[i].y, w = entry.rects[i].w, h = entry.rects[i].h;
+			RECT r = { x, y, x + w, y + h };
+			if (w > 0 && h > 0 && IntersectRect(&r, &r, &bounds))
+			{
+				out.push_back(r);
+			}
+		}
+	}
+
+	// the frames' rectangles, merged while there are more than a few uploads: the pair whose union
+	// adds the least area first
+	auto area = [](const RECT& r)
+	{
+		return int64_t(r.right - r.left) * (r.bottom - r.top);
+	};
+	while (out.size() > 8)
+	{
+		size_t bi = 0, bj = 1;
+		int64_t best = INT64_MAX;
+		for (size_t i = 0; i < out.size(); i++)
+		{
+			for (size_t j = i + 1; j < out.size(); j++)
+			{
+				RECT u;
+				UnionRect(&u, &out[i], &out[j]);
+				int64_t cost = area(u) - area(out[i]) - area(out[j]);
+				if (cost < best)
+				{
+					best = cost;
+					bi = i;
+					bj = j;
+				}
+			}
+		}
+		UnionRect(&out[bi], &out[bi], &out[bj]);
+		out.erase(out.begin() + bj);
+	}
+	return true;
+}
+
 // Uploads the part of the latest complete frame changed since lastSeq into the texture, in place
 bool UpdateLatestFrame(fnui_header* header, uint64_t lastSeq, uint64_t seq, ID3D11Texture2D* texture, uint32_t texWidth, uint32_t texHeight)
 {
@@ -464,10 +527,20 @@ bool UpdateLatestFrame(fnui_header* header, uint64_t lastSeq, uint64_t seq, ID3D
 	} while (InterlockedCompareExchange((volatile LONG*)&header->front, 0, 0) != front);
 
 	const uint32_t frameWidth = header->width[front], frameHeight = header->height[front];
-	RECT changed = ChangedSince(header, lastSeq, seq, std::min(frameWidth, texWidth), std::min(frameHeight, texHeight));
-
-	if (changed.right > changed.left && changed.bottom > changed.top)
+	const uint32_t width = std::min(frameWidth, texWidth), height = std::min(frameHeight, texHeight);
+	static std::vector<RECT> rects;
+	if (!ChangedRects(header, lastSeq, seq, width, height, rects))
 	{
+		rects = { ChangedSince(header, lastSeq, seq, width, height) };
+	}
+
+	for (const RECT& changed : rects)
+	{
+		if (changed.right <= changed.left || changed.bottom <= changed.top)
+		{
+			continue;
+		}
+
 		D3D11_BOX box = { UINT(changed.left), UINT(changed.top), 0, UINT(changed.right), UINT(changed.bottom), 1 };
 		const uint8_t* src = fnui_buffer(header, front) + size_t(changed.top) * header->stride + size_t(changed.left) * 4;
 

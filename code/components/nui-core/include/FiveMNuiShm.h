@@ -30,6 +30,24 @@ struct fnui_dirty
     volatile int32_t x, y, w, h;
 };
 
+/* The same change as a few rectangles (distant changes, as a HUD in a corner and a notification in
+ * another, have a bounding box nearly the size of the view): rects[0 .. count - 1] of frame s in
+ * dirty_rects[s % FNUI_RECTS_RING], written before seq becomes s. A reader that knows it uses it
+ * rather than dirty[] (same rules: an entry whose seq is not that frame means a whole copy). */
+#define FNUI_RECTS_RING 24u
+#define FNUI_RECTS_MAX  4u
+struct fnui_rect
+{
+    int32_t x, y, w, h;
+};
+struct fnui_rects
+{
+    volatile uint64_t seq;
+    volatile uint32_t count;
+    uint32_t reserved;
+    struct fnui_rect rects[FNUI_RECTS_MAX];
+};
+
 struct fnui_header
 {
     uint32_t magic;
@@ -50,6 +68,9 @@ struct fnui_header
     volatile uint32_t dirty_ring;   /* appended: FNUI_DIRTY_RING when dirty[] is filled, 0 = not */
     uint32_t reserved;
     struct fnui_dirty dirty[FNUI_DIRTY_RING];   /* appended, see fnui_dirty */
+    volatile uint32_t rects_ring;   /* appended: FNUI_RECTS_RING when dirty_rects[] is filled */
+    uint32_t reserved2;
+    struct fnui_rects dirty_rects[FNUI_RECTS_RING];   /* appended, see fnui_rects */
 };
 
 /* Input, from the game to the host: a stream of fixed-size little-endian messages over TCP
