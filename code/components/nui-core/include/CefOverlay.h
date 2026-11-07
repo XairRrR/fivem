@@ -362,6 +362,13 @@ namespace nui
 	//void InvokeNUICallback(const char* type, const CefString& name, const CefV8ValueList& arguments);
 	void OVERLAY_DECL ReloadNUI();
 
+	// CefAddCrossOriginWhitelistEntry, kept and applied when the Windows CEF runtime starts (it
+	// starts lazily, with the first CEF browser, when the native Linux host renders the NUI)
+	void OVERLAY_DECL AddCrossOriginWhitelistEntry(const std::string& sourceOrigin, const std::string& targetProtocol, const std::string& targetDomain, bool allowTargetSubdomains);
+
+	// start the Windows CEF runtime if it is not running (before creating a CEF browser)
+	void OVERLAY_DECL EnsureCefRuntime();
+
 	void OVERLAY_DECL CreateFrame(const std::string& frameName, const std::string& frameURL);
 	void OVERLAY_DECL PrepareFrame(const std::string& frameName, const std::string& frameURL);
 	void OVERLAY_DECL DestroyFrame(const std::string& frameName);

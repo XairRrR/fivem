@@ -1455,11 +1455,121 @@ void AddSchemeHandlerFactories(CefRefPtr<CefRequestContext> rc)
 	g_requestContexts.insert(rc);
 }
 
+// the Windows CEF runtime: started with the NUI, or, when the native Linux host renders the NUI
+// and the main menu, only by the first CEF browser FiveM still needs (a DUI): the scheme handler
+// factories and cross-origin entries registered before it are applied when it starts
+static bool g_cefRuntimeStarted;
+static std::once_flag g_cefRuntimeOnce;
+static std::vector<std::tuple<std::string, std::string, std::string, bool>> g_crossOriginEntries;
+
+void AddCrossOriginWhitelistEntry(const std::string& sourceOrigin, const std::string& targetProtocol, const std::string& targetDomain, bool allowTargetSubdomains)
+{
+	std::unique_lock _(g_rcHandlerMutex);
+
+	g_crossOriginEntries.push_back({ sourceOrigin, targetProtocol, targetDomain, allowTargetSubdomains });
+
+	if (g_cefRuntimeStarted)
+	{
+		CefAddCrossOriginWhitelistEntry(sourceOrigin, targetProtocol, targetDomain, allowTargetSubdomains);
+	}
+}
+
+static void StartCefRuntime()
+{
+	std::wstring cachePath = GetNUIStoragePath();
+	auto selfApp = Instance<NUIApp>::Get();
+
+	CefMainArgs args(GetModuleHandle(NULL));
+	CefRefPtr<CefApp> app(selfApp);
+
+	CefSettings cSettings;
+
+	cSettings.multi_threaded_message_loop = true;
+	cSettings.remote_debugging_port = 13172;
+	cSettings.windowless_rendering_enabled = true;
+	cSettings.log_severity = LOGSEVERITY_DEFAULT;
+	cSettings.background_color = 0;
+
+	// Disable google oAuth from being checked/used
+	static const wchar_t* kEnvVars[] = {
+		L"GOOGLE_API_KEY",
+		L"GOOGLE_DEFAULT_CLIENT_ID",
+		L"GOOGLE_DEFAULT_CLIENT_SECRET",
+	};
+
+	for (auto name : kEnvVars)
+	{
+		SetEnvironmentVariableW(name, nullptr);
+	}
+
+	// read the platform version
+	FILE* f = _wfopen(MakeRelativeCitPath(L"citizen/release.txt").c_str(), L"r");
+	int version = 0;
+
+	if (f)
+	{
+		char ver[128];
+
+		fgets(ver, sizeof(ver), f);
+		fclose(f);
+
+		version = atoi(ver);
+	}
+
+	CefString(&cSettings.user_agent_product).FromWString(fmt::sprintf(L"Chrome/%d.%d.%d.%d CitizenFX/1.0.0.%d", cef_version_info(4), cef_version_info(5), cef_version_info(6), cef_version_info(7), version));
+
+	CefString(&cSettings.log_file).FromWString(MakeRelativeCitPath(L"cef_console.txt"));
+
+	CefString(&cSettings.browser_subprocess_path).FromWString(MakeCfxSubProcess(L"ChromeBrowser", L"chrome"));
+
+	CefString(&cSettings.locale).FromASCII("en-US");
+
+	CefString(&cSettings.cookieable_schemes_list).FromString("nui");
+
+	std::wstring resPath = MakeRelativeCitPath(L"bin\\cef");
+
+	CefString(&cSettings.resources_dir_path).FromWString(resPath);
+	CefString(&cSettings.locales_dir_path).FromWString(resPath);
+	CefString(&cSettings.cache_path).FromWString(cachePath);
+
+	// 2014-06-30: sandbox disabled as it breaks scheme handler factories (results in blank page being loaded)
+	CefInitialize(args, cSettings, app.get(), /*cefSandbox*/ nullptr);
+
+	std::unique_lock _(g_rcHandlerMutex);
+	g_cefRuntimeStarted = true;
+
+	for (const auto& [name, domain, factory] : g_schemeHandlers)
+	{
+		CefRegisterSchemeHandlerFactory(name, domain, factory);
+	}
+
+	for (const auto& [source, protocol, domain, subdomains] : g_crossOriginEntries)
+	{
+		CefAddCrossOriginWhitelistEntry(source, protocol, domain, subdomains);
+	}
+}
+
+void EnsureCefRuntime()
+{
+	std::call_once(g_cefRuntimeOnce, []()
+	{
+		if (nui::native::IsMenuActive())
+		{
+			trace("Native NUI: starting the Windows CEF runtime for a DUI browser\n");
+		}
+
+		StartCefRuntime();
+	});
+}
+
 void RegisterSchemeHandlerFactory(const CefString& scheme_name, const CefString& domain_name, CefRefPtr<CefSchemeHandlerFactory> factory)
 {
 	std::unique_lock _(g_rcHandlerMutex);
 
-	CefRegisterSchemeHandlerFactory(scheme_name, domain_name, factory);
+	if (g_cefRuntimeStarted)
+	{
+		CefRegisterSchemeHandlerFactory(scheme_name, domain_name, factory);
+	}
 
 	for (auto& rc : g_requestContexts)
 	{
@@ -1578,72 +1688,26 @@ void Initialize(nui::GameInterface* gi)
 		DeleteFile(MakeRelativeCitPath(L"cef.log").c_str());
 		DeleteFile(MakeRelativeCitPath(L"cef_console.txt").c_str());
 
-		auto selfApp = Instance<NUIApp>::Get();
-
-		CefMainArgs args(GetModuleHandle(NULL));
-		CefRefPtr<CefApp> app(selfApp);
-
-		CefSettings cSettings;
-
-		cSettings.multi_threaded_message_loop = true;
-		cSettings.remote_debugging_port = 13172;
-		cSettings.windowless_rendering_enabled = true;
-		cSettings.log_severity = LOGSEVERITY_DEFAULT;
-		cSettings.background_color = 0;
-
-		// Disable google oAuth from being checked/used
-		static const wchar_t* kEnvVars[] = {
-			L"GOOGLE_API_KEY",
-			L"GOOGLE_DEFAULT_CLIENT_ID",
-			L"GOOGLE_DEFAULT_CLIENT_SECRET",
-		};
-
-		for (auto name : kEnvVars)
+		// the native Linux host renders the root page, the resource frames and the main menu: the
+		// Windows CEF runtime (its browser, network and storage processes) only starts for a DUI
+		if (nui::native::IsMenuActive())
 		{
-			SetEnvironmentVariableW(name, nullptr);
+			trace("Native NUI: Windows CEF runtime not started (it starts with the first DUI browser)\n");
+		}
+		else
+		{
+			nui::EnsureCefRuntime();
 		}
 
-		// read the platform version
-		FILE* f = _wfopen(MakeRelativeCitPath(L"citizen/release.txt").c_str(), L"r");
-		int version = 0;
-
-		if (f)
-		{
-			char ver[128];
-
-			fgets(ver, sizeof(ver), f);
-			fclose(f);
-
-			version = atoi(ver);
-		}
-
-		CefString(&cSettings.user_agent_product).FromWString(fmt::sprintf(L"Chrome/%d.%d.%d.%d CitizenFX/1.0.0.%d", cef_version_info(4), cef_version_info(5), cef_version_info(6), cef_version_info(7), version));
-
-		CefString(&cSettings.log_file).FromWString(MakeRelativeCitPath(L"cef_console.txt"));
-
-		CefString(&cSettings.browser_subprocess_path).FromWString(MakeCfxSubProcess(L"ChromeBrowser", L"chrome"));
-
-		CefString(&cSettings.locale).FromASCII("en-US");
-
-		CefString(&cSettings.cookieable_schemes_list).FromString("nui");
-
-		std::wstring resPath = MakeRelativeCitPath(L"bin\\cef");
-
-		CefString(&cSettings.resources_dir_path).FromWString(resPath);
-		CefString(&cSettings.locales_dir_path).FromWString(resPath);
-		CefString(&cSettings.cache_path).FromWString(cachePath);
-
-		// 2014-06-30: sandbox disabled as it breaks scheme handler factories (results in blank page being loaded)
-		CefInitialize(args, cSettings, app.get(), /*cefSandbox*/ nullptr);
 		nui::RegisterSchemeHandlerFactory("nui", "", Instance<NUISchemeHandlerFactory>::Get());
-		CefAddCrossOriginWhitelistEntry("nui://game", "https", "", true);
-		CefAddCrossOriginWhitelistEntry("nui://game", "http", "", true);
-		CefAddCrossOriginWhitelistEntry("nui://game", "nui", "", true);
+		nui::AddCrossOriginWhitelistEntry("nui://game", "https", "", true);
+		nui::AddCrossOriginWhitelistEntry("nui://game", "http", "", true);
+		nui::AddCrossOriginWhitelistEntry("nui://game", "nui", "", true);
 
 		nui::RegisterSchemeHandlerFactory("https", "nui-game-internal", Instance<NUISchemeHandlerFactory>::Get());
-		CefAddCrossOriginWhitelistEntry("https://nui-game-internal", "https", "", true);
-		CefAddCrossOriginWhitelistEntry("https://nui-game-internal", "http", "", true);
-		CefAddCrossOriginWhitelistEntry("https://nui-game-internal", "nui", "", true);
+		nui::AddCrossOriginWhitelistEntry("https://nui-game-internal", "https", "", true);
+		nui::AddCrossOriginWhitelistEntry("https://nui-game-internal", "http", "", true);
+		nui::AddCrossOriginWhitelistEntry("https://nui-game-internal", "nui", "", true);
 
 		nui::RegisterSchemeHandlerFactory("ws", "", Instance<NUISchemeHandlerFactory>::Get());
 		nui::RegisterSchemeHandlerFactory("wss", "", Instance<NUISchemeHandlerFactory>::Get());

@@ -92,6 +92,10 @@ NUIWindow::~NUIWindow()
 
 fwRefContainer<NUIWindow> NUIWindow::Create(bool primary, int width, int height, CefString url, bool instant, const std::string& context)
 {
+	// a CEF browser needs the Windows CEF runtime (not started when the native Linux host renders
+	// the NUI, until a DUI asks for a browser)
+	nui::EnsureCefRuntime();
+
 	auto window = new NUIWindow(primary, width, height, context);
 
 	if (instant)
