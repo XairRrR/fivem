@@ -89,8 +89,12 @@ bool CopyLatestFrame(fnui_header* header, const nui::GILockedTexture& locked)
 		InterlockedExchange((volatile LONG*)&header->reading, front);
 	} while (InterlockedCompareExchange((volatile LONG*)&header->front, 0, 0) != front);
 
-	uint32_t width = std::min<uint32_t>(header->width[front], locked.width ? locked.width : header->max_width);
-	uint32_t height = std::min<uint32_t>(header->height[front], locked.height ? locked.height : header->max_height);
+	// the header fields are volatile: copy them before std::min, which takes references
+	const uint32_t frameWidth = header->width[front], frameHeight = header->height[front];
+	const uint32_t maxWidth = locked.width ? uint32_t(locked.width) : uint32_t(header->max_width);
+	const uint32_t maxHeight = locked.height ? uint32_t(locked.height) : uint32_t(header->max_height);
+	uint32_t width = std::min(frameWidth, maxWidth);
+	uint32_t height = std::min(frameHeight, maxHeight);
 	const uint8_t* src = fnui_buffer(header, front);
 
 	for (uint32_t y = 0; y < height; y++)
