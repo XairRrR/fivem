@@ -21,6 +21,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windowsx.h>
+#include <d3d11.h>
 
 #include <mutex>
 
@@ -47,6 +48,11 @@ struct NativeFrames
 	fwRefContainer<nui::GITexture> texture;
 	bool tried = false;
 	bool logged = false;
+	// the texture's D3D11 usage allows updating a part of it (UpdateSubresource): only the
+	// rectangles the host changed are uploaded, else each new frame is copied whole (Map)
+	int inPlace = -1;	// -1 not checked yet
+	uint64_t uploaded = 0, frames = 0;
+	DWORD statsTime = 0;
 };
 
 NativeFrames g_native;
@@ -392,6 +398,83 @@ bool CopyLatestFrame(fnui_header* header, const nui::GILockedTexture& locked)
 	return true;
 }
 
+// The part of the view frames (lastSeq, seq] changed (header dirty ring), or all of it when an
+// entry is missing (first frame, overwritten, host without dirty rectangles)
+RECT ChangedSince(fnui_header* header, uint64_t lastSeq, uint64_t seq, uint32_t width, uint32_t height)
+{
+	RECT all = { 0, 0, LONG(width), LONG(height) };
+
+	if (!lastSeq || header->dirty_ring != FNUI_DIRTY_RING || seq - lastSeq >= FNUI_DIRTY_RING)
+	{
+		return all;
+	}
+
+	RECT changed = { 0, 0, 0, 0 };
+	for (uint64_t s = lastSeq + 1; s <= seq; s++)
+	{
+		const volatile fnui_dirty& entry = header->dirty[s % FNUI_DIRTY_RING];
+		uint64_t entrySeq = InterlockedCompareExchange64((volatile LONG64*)&entry.seq, 0, 0);
+
+		if (entrySeq != s)
+		{
+			return all;
+		}
+
+		const int32_t x = entry.x, y = entry.y, w = entry.w, h = entry.h;
+		if (w <= 0 || h <= 0)
+		{
+			continue;
+		}
+
+		RECT r = { x, y, x + w, y + h };
+		if (changed.right <= changed.left)
+		{
+			changed = r;
+		}
+		else
+		{
+			UnionRect(&changed, &changed, &r);
+		}
+	}
+
+	IntersectRect(&changed, &changed, &all);
+	return changed;
+}
+
+// Uploads the part of the latest complete frame changed since lastSeq into the texture, in place
+bool UpdateLatestFrame(fnui_header* header, uint64_t lastSeq, uint64_t seq, ID3D11Texture2D* texture, uint32_t texWidth, uint32_t texHeight)
+{
+	uint32_t front;
+
+	do
+	{
+		front = InterlockedCompareExchange((volatile LONG*)&header->front, 0, 0);
+
+		if (front >= FNUI_BUFFERS)
+		{
+			return false;
+		}
+
+		InterlockedExchange((volatile LONG*)&header->reading, front);
+	} while (InterlockedCompareExchange((volatile LONG*)&header->front, 0, 0) != front);
+
+	const uint32_t frameWidth = header->width[front], frameHeight = header->height[front];
+	RECT changed = ChangedSince(header, lastSeq, seq, std::min(frameWidth, texWidth), std::min(frameHeight, texHeight));
+
+	if (changed.right > changed.left && changed.bottom > changed.top)
+	{
+		D3D11_BOX box = { UINT(changed.left), UINT(changed.top), 0, UINT(changed.right), UINT(changed.bottom), 1 };
+		const uint8_t* src = fnui_buffer(header, front) + size_t(changed.top) * header->stride + size_t(changed.left) * 4;
+
+		// copies the data before returning: the buffer may be released right after
+		g_nuiGi->GetD3D11DeviceContext()->UpdateSubresource(texture, 0, &box, src, header->stride, 0);
+		g_native.uploaded += uint64_t(changed.right - changed.left) * (changed.bottom - changed.top) * 4;
+	}
+
+	InterlockedExchange((volatile LONG*)&header->reading, FNUI_NONE);
+	return true;
+}
+
 void RenderNativeFrames()
 {
 	// DUI textures are used by the game's world: updated even when no NUI is drawn
@@ -434,8 +517,48 @@ void RenderNativeFrames()
 	}
 
 	uint64_t seq = header->seq;
+	auto nativeTexture = static_cast<ID3D11Texture2D*>(g_native.texture->GetNativeTexture());
 
-	if (seq != g_native.lastSeq)
+	if (g_native.inPlace < 0)
+	{
+		D3D11_TEXTURE2D_DESC desc = {};
+		nativeTexture->GetDesc(&desc);
+		g_native.inPlace = desc.Usage == D3D11_USAGE_DEFAULT && g_nuiGi->GetD3D11DeviceContext() ? 1 : 0;
+		trace("Native NUI: texture usage %d, %s\n", int(desc.Usage), g_native.inPlace ? "changed rectangles uploaded in place" : "whole frames copied");
+	}
+
+	if (seq != g_native.lastSeq && g_native.inPlace == 1)
+	{
+		D3D11_TEXTURE2D_DESC desc = {};
+		nativeTexture->GetDesc(&desc);
+
+		if (UpdateLatestFrame(header, g_native.lastSeq, seq, nativeTexture, desc.Width, desc.Height))
+		{
+			g_native.lastSeq = seq;
+			g_native.frames++;
+		}
+
+		if (!g_native.logged)
+		{
+			g_native.logged = true;
+			trace("Native NUI: first frame drawn (in place)\n");
+		}
+
+		// once a minute while frames come: how much was uploaded
+		DWORD now = GetTickCount();
+		if (!g_native.statsTime)
+		{
+			g_native.statsTime = now;
+		}
+		else if (now - g_native.statsTime >= 60000 && g_native.frames)
+		{
+			trace("Native NUI: %llu frames in %u s, %.1f MB uploaded (%.0f KB per frame)\n", g_native.frames, (now - g_native.statsTime) / 1000,
+				g_native.uploaded / 1048576.0, g_native.uploaded / 1024.0 / g_native.frames);
+			g_native.frames = g_native.uploaded = 0;
+			g_native.statsTime = now;
+		}
+	}
+	else if (seq != g_native.lastSeq)
 	{
 		nui::GILockedTexture locked = {};
 

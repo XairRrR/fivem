@@ -17,6 +17,18 @@
 #define FNUI_BUFFERS  3u
 #define FNUI_HEADER   4096u         /* buffers start at this offset, page aligned */
 #define FNUI_NONE     0xffffffffu
+#define FNUI_DIRTY_RING 64u         /* dirty rectangles of the last frames (dirty[] below) */
+
+/* The part of the view frame `seq` changed compared to frame seq - 1 (x, y, width, height); the
+ * entry of frame s is dirty[s % FNUI_DIRTY_RING], written before seq becomes s. A reader that
+ * last copied frame L copies the union of the entries of L+1 .. seq, from the front buffer, or the
+ * whole frame when an entry is missing (its seq field is not that frame: overwritten, or a host
+ * without dirty rectangles). */
+struct fnui_dirty
+{
+    volatile uint64_t seq;
+    volatile int32_t x, y, w, h;
+};
 
 struct fnui_header
 {
@@ -35,6 +47,9 @@ struct fnui_header
     volatile uint32_t input_port;   /* appended: TCP port on 127.0.0.1 for input (fnui_input), 0 = none */
     volatile uint32_t control_port; /* appended: TCP port on 127.0.0.1 for the control channel
                                        (requests, page messages: nui-host/src/bridge.h), 0 = none */
+    volatile uint32_t dirty_ring;   /* appended: FNUI_DIRTY_RING when dirty[] is filled, 0 = not */
+    uint32_t reserved;
+    struct fnui_dirty dirty[FNUI_DIRTY_RING];   /* appended, see fnui_dirty */
 };
 
 /* Input, from the game to the host: a stream of fixed-size little-endian messages over TCP
