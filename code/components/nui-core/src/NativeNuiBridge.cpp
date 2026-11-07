@@ -378,7 +378,9 @@ void AnswerRequest(json request, std::string body)
 
 	CefRefPtr<CefRequest> cefRequest = CefRequest::Create();
 	CefRequest::HeaderMap headerMap;
-	for (auto& [key, value] : request.value("headers", json::object()).items())
+	// a named copy: items() only refers to its json, and a temporary one would be gone before the loop
+	json requestHeaders = request.value("headers", json::object());
+	for (auto& [key, value] : requestHeaders.items())
 	{
 		if (value.is_string())
 		{

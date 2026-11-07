@@ -844,7 +844,8 @@ static void Reader(SOCKET s)
 				if (cd->responseHeaders)
 				{
 					cd->responseHeaders->clear();
-					for (const auto& header : message.value("headers", json::array()))
+					json headers = message.value("headers", json::array());
+					for (const auto& header : headers)
 					{
 						if (header.is_array() && header.size() == 2)
 						{
