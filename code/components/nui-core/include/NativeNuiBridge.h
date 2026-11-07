@@ -57,4 +57,9 @@ void RenderDuis();
 void OnAudioSink();
 // the game's mute state (QueryShouldMute), sent to the host when it changes
 void SetAudioMuted(bool muted);
+
+// The game view for the host's pages (wine-fivem nui-host/src/gameview.h): while on, the game's image
+// (FiveM's game view texture, rage-graphics-five GameViewCapture.cpp) is copied into the host's frame
+// file each frame (NativeNui.cpp)
+void SetGameView(bool on, const std::string& shm);
 }

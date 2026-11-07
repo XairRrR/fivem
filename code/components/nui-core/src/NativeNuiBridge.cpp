@@ -617,6 +617,10 @@ void Reader(SOCKET s)
 		{
 			OnAudioData(message, body);
 		}
+		else if (type == "gameview")
+		{
+			nui::native::SetGameView(message.value("on", false), message.value("shm", ""));
+		}
 		else if (type == "audio-start")
 		{
 			OnAudioStart(message);

@@ -25,8 +25,13 @@
 #include <dxgi1_2.h>
 #include <wrl.h>
 
+#include <algorithm>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 #include <vector>
+
+#include <HostSharedData.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -36,6 +41,9 @@ extern "C"
 }
 
 extern nui::GameInterface* g_nuiGi;
+
+// the game view for the host's pages (below)
+void RenderGameView();
 
 // CefInput.cpp
 int GetCefKeyboardModifiers(WPARAM wparam, LPARAM lparam);
@@ -611,6 +619,12 @@ void RenderNativeFrames()
 		nui::native::RenderDuis();
 	}
 
+	// the game view for the host's pages, when they use it
+	if (nui::native::IsActive())
+	{
+		RenderGameView();
+	}
+
 	// the host's pages are muted when FiveM would mute its own (NUIWindow.cpp: QueryShouldMute)
 	if (nui::native::IsActive())
 	{
@@ -733,10 +747,314 @@ void RenderNativeFrames()
 }
 }
 
+// The game view for the host's pages (NativeNuiBridge.h SetGameView). FiveM renders the game's image
+// into its game view texture while its shared state asks for it (rage-graphics-five
+// GameViewCapture.cpp, the same state FiveM's Chromium sets); that texture is copied to staging
+// textures and read two frames later (the GPU is never waited for), and a worker thread converts it
+// (BGRA -> RGBA, opaque) into the host's frame file.
+struct GameRenderDataLayout		// nui-core NUIInitialize.cpp / rage-graphics-five GameRenderData
+{
+	HANDLE handle = NULL;
+	int width = 0;
+	int height = 0;
+	bool requested = false;
+	bool requestedFlipped = false;
+	HANDLE flippedHandle = NULL;
+};
+
+struct GameView
+{
+	std::mutex lock;				// wanted, path
+	bool wanted = false;
+	std::string path;
+
+	// render thread
+	bool active = false;
+	std::string mappedPath;
+	fnui_header* header = nullptr;
+	HANDLE openedHandle = NULL;
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> staging[3];
+	enum class Slot { Free, Copied, Mapped } slots[3] = { Slot::Free, Slot::Free, Slot::Free };
+	uint64_t copiedFrame[3] = {};
+	uint64_t frame = 0;
+	uint32_t width = 0, height = 0;
+	D3D11_MAPPED_SUBRESOURCE mapped[3] = {};
+	bool logged = false;
+
+	// worker
+	std::thread worker;
+	std::mutex jobLock;
+	std::condition_variable jobReady;
+	int job = -1;					// staging slot to convert, -1 none
+	int done = -1;					// slot converted, waiting to be unmapped
+};
+
+GameView g_gameView;
+
+fnui_header* MapGameViewFile(const std::string& shm)
+{
+	std::wstring path = L"Z:" + ToWide(shm);
+	std::replace(path.begin(), path.end(), L'/', L'\\');
+	HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+	{
+		trace("Native NUI: game view: cannot open %s (%d)\n", shm, GetLastError());
+		return nullptr;
+	}
+	HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+	CloseHandle(file);
+	auto header = mapping ? static_cast<fnui_header*>(MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0)) : nullptr;
+	if (mapping)
+	{
+		CloseHandle(mapping);
+	}
+	if (header && (header->magic != FNUI_MAGIC || header->version != FNUI_VERSION))
+	{
+		UnmapViewOfFile(header);
+		header = nullptr;
+	}
+	return header;
+}
+
+// worker: the mapped staging texture into a buffer of the file neither shown nor read, then published
+void ConvertGameView(int slot)
+{
+	auto& gv = g_gameView;
+	fnui_header* h = gv.header;
+	const D3D11_MAPPED_SUBRESOURCE& m = gv.mapped[slot];
+	uint32_t width = std::min(gv.width, uint32_t(h->max_width));
+	uint32_t height = std::min(gv.height, uint32_t(h->max_height));
+
+	uint32_t front = InterlockedCompareExchange((volatile LONG*)&h->front, 0, 0);
+	uint32_t reading = InterlockedCompareExchange((volatile LONG*)&h->reading, 0, 0);
+	uint32_t target = 0;
+	while (target == front || target == reading)
+	{
+		target++;
+	}
+
+	uint8_t* dst = fnui_buffer(h, target);
+	for (uint32_t y = 0; y < height; y++)
+	{
+		const uint32_t* in = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch);
+		uint32_t* out = reinterpret_cast<uint32_t*>(dst + size_t(y) * h->stride);
+		for (uint32_t x = 0; x < width; x++)
+		{
+			uint32_t v = in[x];	// B G R A in memory
+			out[x] = (v & 0x0000ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16) | 0xff000000;
+		}
+	}
+
+	h->width[target] = width;
+	h->height[target] = height;
+	InterlockedExchange((volatile LONG*)&h->front, target);
+	InterlockedIncrement64((volatile LONG64*)&h->seq);
+}
+
+void GameViewWorker()
+{
+	SetThreadName(-1, "NativeGameView");
+	auto& gv = g_gameView;
+	for (;;)
+	{
+		int slot;
+		{
+			std::unique_lock lock(gv.jobLock);
+			gv.jobReady.wait(lock, [&]
+			{
+				return gv.job >= 0;
+			});
+			slot = gv.job;
+		}
+		ConvertGameView(slot);
+		{
+			std::unique_lock lock(gv.jobLock);
+			gv.job = -1;
+			gv.done = slot;
+		}
+	}
+}
+
+void RenderGameView()
+{
+	auto& gv = g_gameView;
+	static HostSharedData<GameRenderDataLayout> handleData("CfxGameRenderHandle");
+
+	bool wanted;
+	std::string path;
+	{
+		std::unique_lock _(gv.lock);
+		wanted = gv.wanted;
+		path = gv.path;
+	}
+
+	auto context = g_nuiGi->GetD3D11DeviceContext();
+	auto device = g_nuiGi->GetD3D11Device();
+
+	// a converted texture is given back first (also when the view was turned off meanwhile)
+	{
+		std::unique_lock lock(gv.jobLock);
+		if (gv.done >= 0)
+		{
+			context->Unmap(gv.staging[gv.done].Get(), 0);
+			gv.slots[gv.done] = GameView::Slot::Free;
+			gv.done = -1;
+		}
+	}
+
+	if (!wanted)
+	{
+		if (gv.active)
+		{
+			gv.active = false;
+			handleData->requested = false;
+			trace("Native NUI: game view stopped\n");
+		}
+		return;
+	}
+
+	if (!gv.active)
+	{
+		gv.active = true;
+		handleData->requested = true;		// FiveM renders its game view texture from the next frames
+		if (!gv.worker.joinable())
+		{
+			gv.worker = std::thread(GameViewWorker);
+		}
+	}
+
+	if (path != gv.mappedPath)
+	{
+		if (gv.header)
+		{
+			std::unique_lock lock(gv.jobLock);
+			if (gv.job >= 0)
+			{
+				return;		// the worker still writes into the old file
+			}
+			UnmapViewOfFile(gv.header);
+		}
+		gv.header = MapGameViewFile(path);
+		gv.mappedPath = path;
+	}
+
+	if (!gv.header || !handleData->handle || !device || !context)
+	{
+		return;
+	}
+
+	// FiveM's texture (recreated when the game's resolution changes)
+	if (handleData->handle != gv.openedHandle)
+	{
+		std::unique_lock lock(gv.jobLock);
+		if (gv.job >= 0)
+		{
+			return;
+		}
+		for (int i = 0; i < 3; i++)
+		{
+			if (gv.slots[i] == GameView::Slot::Mapped)
+			{
+				context->Unmap(gv.staging[i].Get(), 0);
+			}
+			gv.slots[i] = GameView::Slot::Free;
+			gv.staging[i].Reset();
+		}
+		gv.done = -1;
+		gv.source.Reset();
+		gv.openedHandle = handleData->handle;
+
+		if (FAILED(device->OpenSharedResource(handleData->handle, IID_PPV_ARGS(&gv.source))))
+		{
+			trace("Native NUI: game view: cannot open FiveM's game view texture\n");
+			return;
+		}
+
+		D3D11_TEXTURE2D_DESC desc;
+		gv.source->GetDesc(&desc);
+		gv.width = desc.Width;
+		gv.height = desc.Height;
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.BindFlags = 0;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		desc.MiscFlags = 0;
+		for (int i = 0; i < 3; i++)
+		{
+			if (FAILED(device->CreateTexture2D(&desc, nullptr, &gv.staging[i])))
+			{
+				gv.source.Reset();
+				return;
+			}
+		}
+		trace("Native NUI: game view %ux%u (format %d)\n", gv.width, gv.height, int(desc.Format));
+	}
+
+	if (!gv.source)
+	{
+		return;
+	}
+
+	gv.frame++;
+
+	// the oldest copy at least two frames old goes to the worker, without waiting for the GPU
+	{
+		std::unique_lock lock(gv.jobLock);
+		if (gv.job < 0 && gv.done < 0)
+		{
+			int oldest = -1;
+			for (int i = 0; i < 3; i++)
+			{
+				if (gv.slots[i] == GameView::Slot::Copied && gv.frame - gv.copiedFrame[i] >= 2 &&
+					(oldest < 0 || gv.copiedFrame[i] < gv.copiedFrame[oldest]))
+				{
+					oldest = i;
+				}
+			}
+			if (oldest >= 0 && SUCCEEDED(context->Map(gv.staging[oldest].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &gv.mapped[oldest])))
+			{
+				gv.slots[oldest] = GameView::Slot::Mapped;
+				gv.job = oldest;
+				gv.jobReady.notify_one();
+				if (!gv.logged)
+				{
+					gv.logged = true;
+					trace("Native NUI: game view: first image to the host\n");
+				}
+			}
+		}
+	}
+
+	// this frame's image into a free staging texture
+	for (int i = 0; i < 3; i++)
+	{
+		if (gv.slots[i] == GameView::Slot::Free)
+		{
+			context->CopyResource(gv.staging[i].Get(), gv.source.Get());
+			gv.slots[i] = GameView::Slot::Copied;
+			gv.copiedFrame[i] = gv.frame;
+			break;
+		}
+	}
+}
+
 // NativeNuiBridge.cpp: DUI frames, same file format
 bool CopyNativeFrame(fnui_header* header, const nui::GILockedTexture& locked)
 {
 	return CopyLatestFrame(header, locked);
+}
+
+namespace nui::native
+{
+void SetGameView(bool on, const std::string& shm)
+{
+	std::unique_lock _(g_gameView.lock);
+	g_gameView.wanted = on;
+	if (!shm.empty())
+	{
+		g_gameView.path = shm;
+	}
+}
 }
 
 static HookFunction initFunction([]()
