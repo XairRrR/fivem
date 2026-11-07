@@ -108,7 +108,21 @@ int main(void)
             matched++;
         }
     }
-    CHECK( matched > 0, "an instance of the DXGI adapter (%ls) with the 3D engine", ref );
+    /* Windows: one instance per process and engine, pid_<pid>_luid_0x<hi>_0x<lo>_phys_0_eng_<n>_engtype_3D;
+     * a virtual machine reports its engines under another LUID than the DXGI adapter (oracle) */
+    {
+        DWORD formatted = 0;
+        for (DWORD i = 0; i < items2; i++)
+        {
+            unsigned int pid, hi, lo, phys, eng;
+            if (swscanf( second[i].szName, L"pid_%u_luid_0x%08X_0x%08X_phys_%u_eng_%u", &pid, &hi, &lo, &phys, &eng ) == 5)
+                formatted++;
+        }
+        CHECK( formatted == items2, "the instances are named like on Windows (%lu of %lu)", formatted, items2 );
+    }
+    if (matched || GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "wine_get_version" ))
+        CHECK( matched > 0, "an instance of the DXGI adapter (%ls) with the 3D engine", ref );
+    else printf( "skip: no instance for the DXGI adapter (a virtual machine reports another LUID)\n" );
     printf( "GPU usage %.1f%%\n", total );
     free( first );
     free( second );

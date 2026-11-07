@@ -55,7 +55,8 @@ static void test_cpu( const WCHAR *path )
     stop = 1;
     WaitForMultipleObjects( n, threads, TRUE, 5000 );
     for (i = 0; i < n; i++) CloseHandle( threads[i] );
-    CHECK( !status && busy > 50 && busy <= 100, "%ls with %lu busy threads: %.1f%%", path, n, busy );
+    /* % Processor Utility accounts for the frequency and goes over 100 on Windows (132% measured) */
+    CHECK( !status && busy > 50 && busy <= 400, "%ls with %lu busy threads: %.1f%%", path, n, busy );
     PdhCloseQuery( query );
 }
 
