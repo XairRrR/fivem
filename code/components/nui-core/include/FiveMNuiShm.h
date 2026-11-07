@@ -33,6 +33,8 @@ struct fnui_header
     volatile uint32_t height[FNUI_BUFFERS];
     volatile uint32_t host_alive;   /* 1 while the host runs */
     volatile uint32_t input_port;   /* appended: TCP port on 127.0.0.1 for input (fnui_input), 0 = none */
+    volatile uint32_t control_port; /* appended: TCP port on 127.0.0.1 for the control channel
+                                       (requests, page messages: nui-host/src/bridge.h), 0 = none */
 };
 
 /* Input, from the game to the host: a stream of fixed-size little-endian messages over TCP
