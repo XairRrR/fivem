@@ -1,6 +1,7 @@
 /* CertFindChainInStore(CERT_CHAIN_FIND_BY_ISSUER) (libcef, certificats clients) : recherche par émetteur
  * parmi les certificats ayant une clé privée. Sans résultat : NULL et CRYPT_E_NOT_FOUND (Windows
  * Server 2022, tests/misc2-explore.c). Wine n'avait qu'un stub. */
+#define CERT_CHAIN_FIND_BY_ISSUER_PARA_HAS_EXTRA_FIELDS   /* as the Windows SDK requires for the indexes */
 #include <windows.h>
 #include <wincrypt.h>
 #include <stdio.h>
