@@ -39,6 +39,9 @@ extern "C"
 #include "FiveMNuiShm.h"
 }
 
+extern nui::GameInterface* g_nuiGi;
+extern HCURSOR g_defaultCursor;
+
 namespace
 {
 using json = nlohmann::json;
@@ -333,6 +336,36 @@ void AnswerRequest(json request, std::string body)
 	reply(status ? status : 200, response->GetMimeType().ToString(), headers, data);
 }
 
+// the host page's cursor by name, as FiveM's CEF gives it a native cursor (NUIClient::OnCursorChange)
+void SetCursorByName(const std::string& name)
+{
+	// resource ids: IDC_* are char or wchar_t pointers depending on UNICODE
+	static const std::map<std::string, ULONG_PTR> cursors = {
+		{ "hand", ULONG_PTR(IDC_HAND) }, { "ibeam", ULONG_PTR(IDC_IBEAM) }, { "wait", ULONG_PTR(IDC_WAIT) }, { "progress", ULONG_PTR(IDC_APPSTARTING) },
+		{ "cross", ULONG_PTR(IDC_CROSS) }, { "help", ULONG_PTR(IDC_HELP) }, { "move", ULONG_PTR(IDC_SIZEALL) }, { "notallowed", ULONG_PTR(IDC_NO) },
+		{ "ns", ULONG_PTR(IDC_SIZENS) }, { "ew", ULONG_PTR(IDC_SIZEWE) }, { "nesw", ULONG_PTR(IDC_SIZENESW) }, { "nwse", ULONG_PTR(IDC_SIZENWSE) },
+	};
+
+	if (!g_nuiGi || !nui::HasFocus())
+	{
+		return;
+	}
+
+	auto it = cursors.find(name);
+	if (it != cursors.end())
+	{
+		g_nuiGi->SetHostCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(WORD(it->second))));
+	}
+	else if (name == "none")
+	{
+		g_nuiGi->SetHostCursor(nullptr);
+	}
+	else
+	{
+		g_nuiGi->SetHostCursor(g_defaultCursor);
+	}
+}
+
 void HandleProcessMessage(const json& message)
 {
 	std::string name = message.value("name", "");
@@ -387,6 +420,10 @@ void Reader(SOCKET s)
 		else if (type == "process")
 		{
 			HandleProcessMessage(message);
+		}
+		else if (type == "cursor")
+		{
+			SetCursorByName(message.value("name", ""));
 		}
 		else if (type == "hello")
 		{
