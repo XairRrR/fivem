@@ -154,7 +154,27 @@ struct FeatureTraits_TopLevelMPMenu
 	static constexpr const uint32_t kId = 10001;
 };
 
-using Feature_TopLevelMPMenu = Feature<FeatureTraits_TopLevelMPMenu>;
+// the main menu in its own top-level window, unless the native Linux host renders it as a frame of
+// its root page (FiveM's frame path for mpMenu)
+struct Feature_TopLevelMPMenu
+{
+	static bool IsEnabled()
+	{
+		return Feature<FeatureTraits_TopLevelMPMenu>::IsEnabled() && !nui::native::IsMenuActive();
+	}
+
+	template<typename Func>
+	static bool RunIfEnabled(Func&& func)
+	{
+		if (IsEnabled())
+		{
+			func();
+			return true;
+		}
+
+		return false;
+	}
+};
 
 bool g_mainUIFlag = true;
 bool g_shouldHideCursor;
@@ -591,7 +611,7 @@ namespace nui
 
 	__declspec(dllexport) void DestroyFrame(const std::string& frameName)
 	{
-		if (frameName == "mpMenu")
+		if (frameName == "mpMenu" && Feature_TopLevelMPMenu::IsEnabled())
 		{
 			auto winName = fmt::sprintf("nui_%s", frameName);
 			DestroyNUIWindow(winName);

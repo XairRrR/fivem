@@ -15,6 +15,10 @@ namespace nui::native
 // control channel connected, on first use)
 bool IsActive();
 
+// the main menu (mpMenu) is also rendered by the host, as a frame of its root page
+// (CitizenFX_NativeNUIMenu=1, opt-in)
+bool IsMenuActive();
+
 // a process message for a frame of the host ("" = the root page), as FiveM sends to its CEF
 void PostProcessMessage(const std::string& frame, const std::string& name, const std::vector<std::string>& args);
 

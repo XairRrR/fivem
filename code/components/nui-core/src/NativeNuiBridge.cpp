@@ -32,6 +32,8 @@
 
 #include <json.hpp>
 
+#include "SharedLegitimacyAPI.h"
+
 #pragma comment(lib, "ws2_32.lib")
 
 extern "C"
@@ -388,6 +390,28 @@ void HandleProcessMessage(const json& message)
 	}
 }
 
+// FiveM adds the Cfx.re entitlement header to requests of its trusted frames (the main menu) for
+// the hosts the legitimacy component handles (NUIClient::OnBeforeResourceLoad); the host asks for
+// it for each such request of its own
+void AnswerHeaders(const json& message)
+{
+	json set = json::object();
+	std::string host = message.value("host", "");
+
+	if (!host.empty() && cfx::legitimacy::ShouldProcessHeaders(host.c_str()))
+	{
+		char key[256] = { 0 };
+		char value[2048] = { 0 };
+		cfx::legitimacy::ProcessHeaders(key, value);
+		if (key[0])
+		{
+			set[key] = value;
+		}
+	}
+
+	Send(json{ { "t", "headers-res" }, { "id", message.value("id", 0u) }, { "set", set } });
+}
+
 void Reader(SOCKET s)
 {
 	SetThreadName(-1, "NativeNuiBridge");
@@ -420,6 +444,10 @@ void Reader(SOCKET s)
 		else if (type == "process")
 		{
 			HandleProcessMessage(message);
+		}
+		else if (type == "headers")
+		{
+			AnswerHeaders(message);
 		}
 		else if (type == "cursor")
 		{
@@ -504,6 +532,18 @@ bool IsActive()
 {
 	std::call_once(g_bridge.init, Connect);
 	return g_bridge.active;
+}
+
+bool IsMenuActive()
+{
+	static bool wanted = []
+	{
+		wchar_t value[8];
+		DWORD length = GetEnvironmentVariableW(L"CitizenFX_NativeNUIMenu", value, std::size(value));
+		return length == 1 && value[0] == L'1';
+	}();
+
+	return wanted && IsActive();
 }
 
 void PostProcessMessage(const std::string& frame, const std::string& name, const std::vector<std::string>& args)
