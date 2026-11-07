@@ -640,6 +640,13 @@ namespace nui
 
 	void RecreateFrames()
 	{
+		// called when FiveM's own root page (re)loads: in native mode it hosts no frame, the host
+		// already has them
+		if (nui::native::IsActive())
+		{
+			return;
+		}
+
 		std::vector<std::pair<std::string, std::string>> frameData;
 
 		{
