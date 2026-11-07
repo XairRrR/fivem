@@ -64,10 +64,9 @@ static void nsp(void)
         printf( "  next done, err %d\n", WSAGetLastError() );
         printf( "WSALookupServiceEnd %d\n", WSALookupServiceEnd( lookup ) );
     }
-    n = WSALookupServiceEnd( (HANDLE)0x1234 );
-    printf( "WSALookupServiceEnd(bogus) %d err %d\n", n, n ? WSAGetLastError() : 0 );
-    n = WSALookupServiceEnd( NULL );
-    printf( "WSALookupServiceEnd(NULL) %d err %d\n", n, n ? WSAGetLastError() : 0 );
+    /* WSALookupServiceEnd((HANDLE)0x1234) crashes on Windows (oracle run 42359021710) */
+    GUARD( "WSALookupServiceEnd(NULL)", n = WSALookupServiceEnd( NULL );
+           printf( "WSALookupServiceEnd(NULL) %d err %d\n", n, n ? WSAGetLastError() : 0 ) );
     WSACleanup();
 }
 
