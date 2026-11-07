@@ -466,7 +466,9 @@ bool ChangedRects(fnui_header* header, uint64_t lastSeq, uint64_t seq, uint32_t 
 			return false;
 		}
 
-		uint32_t count = std::min<uint32_t>(entry.count, FNUI_RECTS_MAX);
+		// volatile: copied before std::min, which takes references
+		const uint32_t entryCount = entry.count;
+		uint32_t count = std::min<uint32_t>(entryCount, FNUI_RECTS_MAX);
 		for (uint32_t i = 0; i < count; i++)
 		{
 			const int32_t x = entry.rects[i].x, y = entry.rects[i].y, w = entry.rects[i].w, h = entry.rects[i].h;
