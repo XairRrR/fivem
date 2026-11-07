@@ -151,6 +151,12 @@ int main(void)
         SetEvent( event );
         WaitForMultipleObjects( 3, threads, TRUE, 5000 );
     }
+    {
+        PROCESS_POWER_THROTTLING_STATE ps = { 1, 0xcccc, 0xcccc };
+        SetLastError( 0xdeadbeef );
+        CHECK( !GetProcessInformation( GetCurrentProcess(), ProcessPowerThrottling, &ps, sizeof(ps) ) &&
+               GetLastError() == ERROR_INVALID_PARAMETER, "the process state cannot be read back (%lu)", GetLastError() );
+    }
     CHECK( !pset( 1, 4, 4, &err ) && err == ERROR_INVALID_PARAMETER, "process IGNORE_TIMER_RESOLUTION: ERROR_INVALID_PARAMETER (%lu)", err );
     CHECK( !pset( 2, 1, 1, &err ) && err == ERROR_INVALID_PARAMETER, "process version 2 (%lu)", err );
     CHECK( pset( 1, 0, 0, &err ), "process default" );
