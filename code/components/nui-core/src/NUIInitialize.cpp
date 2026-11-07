@@ -9,6 +9,7 @@
 #include "NUIApp.h"
 #include "NUIClient.h"
 #include "NUISchemeHandlerFactory.h"
+#include "NativeNuiBridge.h"
 #include "NUIWindowManager.h"
 
 #include <CL2LaunchMode.h>
@@ -1446,6 +1447,9 @@ void RegisterSchemeHandlerFactory(const CefString& scheme_name, const CefString&
 	}
 
 	g_schemeHandlers.push_back({ scheme_name, domain_name, factory });
+
+	// the native Linux host's requests are answered with the same factories
+	nui::native::RegisterFactory(scheme_name.ToString(), domain_name.ToString(), factory);
 }
 
 extern std::unordered_map<std::string, fwRefContainer<NUIWindow>> windowList;

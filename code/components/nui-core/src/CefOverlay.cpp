@@ -8,6 +8,7 @@
 #include "StdInc.h"
 
 #include "CefOverlay.h"
+#include "NativeNuiBridge.h"
 #include "NUIApp.h"
 #include "NUIClient.h"
 #include "NUIWindowManager.h"
@@ -268,6 +269,15 @@ namespace nui
 
 	static void PostJSEvent(const std::string& type, std::vector<std::string>&& args)
 	{
+		// the native Linux host renders the root page and the resource frames
+		if (nui::native::IsActive())
+		{
+			std::vector<std::string> list{ type };
+			list.insert(list.end(), args.begin(), args.end());
+			nui::native::PostProcessMessage("", "pushEvent", list);
+			return;
+		}
+
 		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
 
 		static auto initThread = []
@@ -542,7 +552,11 @@ namespace nui
 			}))
 			{
 				auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
-				if (shouldHaveRootWindow && rootWindow.GetRef())
+				if (nui::native::IsActive())
+				{
+					nui::native::PostProcessMessage("", "createFrame", { frameName, frameURL });
+				}
+				else if (shouldHaveRootWindow && rootWindow.GetRef())
 				{
 					auto browser = rootWindow->GetBrowser();
 
@@ -581,6 +595,15 @@ namespace nui
 		{
 			auto winName = fmt::sprintf("nui_%s", frameName);
 			DestroyNUIWindow(winName);
+
+			std::unique_lock<std::shared_mutex> lock(frameListMutex);
+			frameList.erase(frameName);
+			return;
+		}
+
+		if (nui::native::IsActive())
+		{
+			nui::native::PostProcessMessage("", "destroyFrame", { frameName });
 
 			std::unique_lock<std::shared_mutex> lock(frameListMutex);
 			frameList.erase(frameName);

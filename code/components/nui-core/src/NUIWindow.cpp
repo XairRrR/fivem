@@ -7,6 +7,7 @@
 
 #include "StdInc.h"
 #include "NUIWindow.h"
+#include "NativeNuiBridge.h"
 
 #include "NUIClient.h"
 #include "NUIWindowManager.h"
@@ -360,6 +361,12 @@ void NUIWindow::UpdateFrame()
 
 		for (auto& item : m_pollQueue)
 		{
+			if (nui::native::IsActive())
+			{
+				nui::native::PostProcessMessage("", "doPoll", { item });
+				continue;
+			}
+
 			NUIClient* client = static_cast<NUIClient*>(m_client.get());
 			auto browser = client->GetBrowser();
 
