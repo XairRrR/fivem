@@ -57,10 +57,6 @@ struct Bridge
 	std::mutex factoryLock;
 	std::condition_variable factoryAdded;
 	std::vector<std::tuple<std::string, std::string, CefRefPtr<CefSchemeHandlerFactory>>> factories;
-	// the root page is loaded once the connection is up and FiveM's nui:// factory exists (it is
-	// registered right after CefInitialize, while the game may already talk to the host)
-	std::atomic<bool> nuiFactory = false;
-	std::once_flag rootLoaded;
 };
 
 Bridge g_bridge;
@@ -216,17 +212,6 @@ CefRefPtr<CefSchemeHandlerFactory> FindFactory(const std::string& scheme, const 
 	return factory;
 }
 
-void LoadRootPage()
-{
-	if (g_bridge.active && g_bridge.nuiFactory)
-	{
-		std::call_once(g_bridge.rootLoaded, []
-		{
-			// the root page hosting the resource frames, as FiveM's CEF loads it (ui_rootUrl)
-			Send(json{ { "t", "navigate" }, { "url", "nui://game/ui/root.html" } });
-		});
-	}
-}
 
 // Answers one request of the host with FiveM's handlers, driven like CEF does
 void AnswerRequest(json request, std::string body)
@@ -550,8 +535,6 @@ void Connect()
 			}
 		}
 	}
-
-	LoadRootPage();
 }
 }
 
@@ -591,11 +574,7 @@ void RegisterFactory(const std::string& scheme, const std::string& domain, CefRe
 	{
 		Send(json{ { "t", "domain" }, { "name", domain } });
 	}
-	if (scheme == "nui")
-	{
-		g_bridge.nuiFactory = true;
-		LoadRootPage();
-	}
+
 }
 
 void Navigate(const std::string& url)

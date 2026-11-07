@@ -1401,6 +1401,13 @@ std::string GetContext();
 
 void CreateRootWindow()
 {
+	// the native Linux host loads its root page when FiveM would load its own (ui.zip is mounted,
+	// and on each context switch), with the frames FiveM knows of, as its root page does on load
+	if (nui::native::IsActive())
+	{
+		nui::ReloadNUI();
+	}
+
 	// the native Linux host renders the root page, the resource frames and the main menu: no
 	// Windows CEF browser (nor its renderer and GPU processes) is created for it
 	if (nui::native::IsMenuActive())
@@ -1675,6 +1682,13 @@ void Initialize(nui::GameInterface* gi)
 					}
 				}
 			}
+		}
+
+		// native Linux host: its root page, now that ui.zip is mounted (FiveM's own root page comes
+		// with the first root window; the main menu is a frame of the host's root page)
+		if (nui::native::IsActive())
+		{
+			nui::ReloadNUI();
 		}
 
 		if (nui::HasMainUI())
