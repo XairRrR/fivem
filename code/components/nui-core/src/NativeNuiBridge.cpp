@@ -62,6 +62,73 @@ struct Bridge
 
 Bridge g_bridge;
 
+// audio streams of the host's browsers (sid -> the sink's stream)
+std::mutex g_audioLock;
+std::map<int, std::shared_ptr<nui::IAudioStream>> g_audioStreams;
+std::atomic<int> g_audioMuted = -1;	// -1: not sent yet
+
+void OnAudioStart(const json& message)
+{
+	auto sink = nui::GetAudioSink();
+	if (!sink)
+	{
+		return;
+	}
+
+	nui::AudioStreamParams params;
+	params.channels = message.value("channels", 2);
+	params.channelLayout = nui::CefChannelLayout(message.value("layout", 3));
+	params.sampleRate = message.value("rate", 48000);
+	params.framesPerBuffer = message.value("frames", 1024);
+	params.frameName = message.value("frame", "");
+
+	auto stream = sink->CreateAudioStream(params);
+	if (stream)
+	{
+		std::unique_lock _(g_audioLock);
+		g_audioStreams[message.value("sid", 0)] = stream;
+	}
+}
+
+void OnAudioData(const json& message, const std::string& body)
+{
+	std::shared_ptr<nui::IAudioStream> stream;
+	{
+		std::unique_lock _(g_audioLock);
+		auto it = g_audioStreams.find(message.value("sid", 0));
+		if (it == g_audioStreams.end())
+		{
+			return;
+		}
+		stream = it->second;
+	}
+
+	int frames = message.value("frames", 0);
+	if (frames <= 0)
+	{
+		return;
+	}
+	size_t channels = body.size() / (sizeof(float) * frames);
+	if (!channels || channels > 8 || channels * sizeof(float) * frames != body.size())
+	{
+		return;
+	}
+
+	// planar: channel c's frames follow channel c - 1's
+	const float* planes[8];
+	for (size_t c = 0; c < channels; c++)
+	{
+		planes[c] = reinterpret_cast<const float*>(body.data()) + c * frames;
+	}
+	stream->ProcessPacket(planes, frames, int64_t(message.value("pts", 0.0)));
+}
+
+void OnAudioStop(const json& message)
+{
+	std::unique_lock _(g_audioLock);
+	g_audioStreams.erase(message.value("sid", 0));
+}
+
 // DUI browsers of the host (nui::native::CreateDui)
 struct NativeDui
 {
@@ -544,6 +611,18 @@ void Reader(SOCKET s)
 		{
 			SetCursorByName(message.value("name", ""));
 		}
+		else if (type == "audio-data")
+		{
+			OnAudioData(message, body);
+		}
+		else if (type == "audio-start")
+		{
+			OnAudioStart(message);
+		}
+		else if (type == "audio-stop")
+		{
+			OnAudioStop(message);
+		}
 		else if (type == "dui-created")
 		{
 			OnDuiCreated(message);
@@ -560,6 +639,11 @@ void Reader(SOCKET s)
 
 	trace("Native NUI: control channel closed\n");
 	g_bridge.active = false;
+
+	{
+		std::unique_lock _(g_audioLock);
+		g_audioStreams.clear();
+	}
 
 	// the host closes the DUI browsers with the connection
 	std::unique_lock _(g_duiLock);
@@ -617,6 +701,12 @@ void Connect()
 	std::thread(Reader, s).detach();
 	trace("Native NUI: control channel connected on port %d\n", header.control_port);
 
+	// the pages' audio is played by the game when it has its NUI audio sink
+	if (nui::GetAudioSink())
+	{
+		Send(json{ { "t", "audio-sink" } });
+	}
+
 	// the host needs to know which http(s) hosts the game serves
 	{
 		std::unique_lock _(g_bridge.factoryLock);
@@ -673,6 +763,23 @@ void RegisterFactory(const std::string& scheme, const std::string& domain, CefRe
 void Navigate(const std::string& url)
 {
 	Send(json{ { "t", "navigate" }, { "url", url } });
+}
+
+void OnAudioSink()
+{
+	// set after the connection: tell the host now (before, Connect does)
+	if (g_bridge.active)
+	{
+		Send(json{ { "t", "audio-sink" } });
+	}
+}
+
+void SetAudioMuted(bool muted)
+{
+	if (g_audioMuted.exchange(muted ? 1 : 0) != (muted ? 1 : 0))
+	{
+		Send(json{ { "t", "audio-mute" }, { "muted", muted } });
+	}
 }
 
 bool CreateDui(const std::string& handle, int width, int height, const std::string& url)

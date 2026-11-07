@@ -7,6 +7,7 @@
 
 #include "StdInc.h"
 #include "NUIClient.h"
+#include "NativeNuiBridge.h"
 #include "NUIRenderHandler.h"
 #include "NUISchemeHandlerFactory.h"
 #include "CefOverlay.h"
@@ -89,6 +90,14 @@ namespace nui
 	void SetAudioSink(IAudioSink* sinkRef)
 	{
 		g_audioSink = sinkRef;
+
+		// the native Linux host's pages play through it too
+		nui::native::OnAudioSink();
+	}
+
+	IAudioSink* GetAudioSink()
+	{
+		return g_audioSink;
 	}
 
 	void RecreateFrames();

@@ -11,6 +11,12 @@
 
 #include "CefOverlay.h"
 
+namespace nui
+{
+// FiveM's NUI audio sink (NUIClient.cpp), null before extra-natives sets it
+IAudioSink* GetAudioSink();
+}
+
 namespace nui::native
 {
 // true when a native Linux host renders the NUI (CitizenFX_NativeNUIFrames set and the host's
@@ -45,4 +51,10 @@ bool IsDuiAvailable(const std::string& handle);
 fwRefContainer<nui::GITexture> GetDuiTexture(const std::string& handle);
 // render thread, each frame: new DUI frames into their textures
 void RenderDuis();
+
+// Audio of the host's pages, played by the game through FiveM's NUI audio sink (as NUIClient.cpp
+// does with its own Chromium; wine-fivem nui-host/src/audio.h): the sink was set (tells the host)
+void OnAudioSink();
+// the game's mute state (QueryShouldMute), sent to the host when it changes
+void SetAudioMuted(bool muted);
 }

@@ -22,6 +22,8 @@
 #include <ws2tcpip.h>
 #include <windowsx.h>
 #include <d3d11.h>
+#include <dxgi1_2.h>
+#include <wrl.h>
 
 #include <mutex>
 
@@ -51,6 +53,9 @@ struct NativeFrames
 	// the texture's D3D11 usage allows updating a part of it (UpdateSubresource): only the
 	// rectangles the host changed are uploaded, else each new frame is copied whole (Map)
 	int inPlace = -1;	// -1 not checked yet
+	// the texture the game draws, when shared with it (default usage: updatable in part)
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> shared;
+	HANDLE sharedHandle = nullptr;
 	uint64_t uploaded = 0, frames = 0;
 	DWORD statsTime = 0;
 };
@@ -475,12 +480,68 @@ bool UpdateLatestFrame(fnui_header* header, uint64_t lastSeq, uint64_t seq, ID3D
 	return true;
 }
 
+// A default-usage texture of ours, given to the game through a share handle (as FiveM's CEF frames
+// are): the game draws it, and only the changed rectangles are uploaded into it. The textures
+// CreateTextureBacking makes are dynamic: they can only be rewritten whole.
+fwRefContainer<nui::GITexture> CreateSharedTexture(uint32_t width, uint32_t height)
+{
+	ID3D11Device* device = g_nuiGi->GetD3D11Device();
+	if (!device)
+	{
+		return nullptr;
+	}
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = width;
+	desc.Height = height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+	HRESULT hr = device->CreateTexture2D(&desc, nullptr, &texture);
+	if (FAILED(hr))
+	{
+		trace("Native NUI: shared texture not created (0x%08x)\n", hr);
+		return nullptr;
+	}
+
+	Microsoft::WRL::ComPtr<IDXGIResource1> resource;
+	HANDLE handle = nullptr;
+	if (FAILED(texture.As(&resource)) ||
+		FAILED(hr = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle)))
+	{
+		trace("Native NUI: no share handle for the texture (0x%08x)\n", hr);
+		return nullptr;
+	}
+
+	g_native.shared = texture;
+	g_native.sharedHandle = handle;
+	return g_nuiGi->CreateTextureFromShareHandle(handle, int(width), int(height), []()
+	{
+		trace("Native NUI: the game could not open the shared texture\n");
+		return true;
+	});
+}
+
 void RenderNativeFrames()
 {
 	// DUI textures are used by the game's world: updated even when no NUI is drawn
 	if (nui::native::IsMenuActive())
 	{
 		nui::native::RenderDuis();
+	}
+
+	// the host's pages are muted when FiveM would mute its own (NUIWindow.cpp: QueryShouldMute)
+	if (nui::native::IsActive())
+	{
+		bool shouldMute = false;
+		g_nuiGi->QueryShouldMute(shouldMute);
+		nui::native::SetAudioMuted(shouldMute);
 	}
 
 	if (!g_native.tried)
@@ -507,7 +568,11 @@ void RenderNativeFrames()
 	if (!g_native.texture.GetRef())
 	{
 		// materialized on the render queue: drawn from the next frames on
-		g_native.texture = g_nuiGi->CreateTextureBacking(header->max_width, header->max_height, nui::GITextureFormat::ARGB);
+		g_native.texture = CreateSharedTexture(header->max_width, header->max_height);
+		if (!g_native.texture.GetRef())
+		{
+			g_native.texture = g_nuiGi->CreateTextureBacking(header->max_width, header->max_height, nui::GITextureFormat::ARGB);
+		}
 		return;
 	}
 
@@ -524,7 +589,8 @@ void RenderNativeFrames()
 		D3D11_TEXTURE2D_DESC desc = {};
 		nativeTexture->GetDesc(&desc);
 		g_native.inPlace = desc.Usage == D3D11_USAGE_DEFAULT && g_nuiGi->GetD3D11DeviceContext() ? 1 : 0;
-		trace("Native NUI: texture usage %d, %s\n", int(desc.Usage), g_native.inPlace ? "changed rectangles uploaded in place" : "whole frames copied");
+		trace("Native NUI: texture usage %d%s, %s\n", int(desc.Usage), g_native.shared.Get() ? " (shared)" : "",
+			g_native.inPlace ? "changed rectangles uploaded in place" : "whole frames copied");
 	}
 
 	if (seq != g_native.lastSeq && g_native.inPlace == 1)
