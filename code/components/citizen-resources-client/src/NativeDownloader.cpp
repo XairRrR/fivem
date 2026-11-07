@@ -4,8 +4,9 @@
  * libcurl outside Wine and written straight into the cache folder; the game only receives progress
  * and the result. Protocol: wine-fivem fivem-helper/src/helper.cc.
  *
- * Without CitizenFX_NativeHelper (or if the helper cannot be reached) nothing changes: FiveM's
- * HttpClient downloads as before.
+ * Launched by the native launcher (CitizenFX_NativeHelper set), downloads are native only: when the
+ * helper cannot be reached the download fails with that error, there is no fallback under Wine.
+ * Without the variable (FiveM started otherwise, no helper) FiveM's HttpClient downloads as before.
  */
 
 #include "StdInc.h"
@@ -309,16 +310,26 @@ namespace fx::native_downloads
 HttpRequestPtr DoFileGetRequest(const std::string& url, const std::string& windowsPath, const HttpRequestOptions& options,
 	const std::function<void(bool, const char*, size_t)>& callback)
 {
-	std::call_once(g_helper.init, Connect);
-	if (!g_helper.active)
+	// not launched by the native launcher: HttpClient (the caller's)
+	if (!GetEnvironmentVariableA("CitizenFX_NativeHelper", nullptr, 0))
 	{
 		return nullptr;
 	}
 
-	std::string unixPath = UnixPath(windowsPath);
-	if (unixPath.empty())
+	std::call_once(g_helper.init, Connect);
+	std::string unixPath = g_helper.active ? UnixPath(windowsPath) : std::string{};
+	if (!g_helper.active || unixPath.empty())
 	{
-		return nullptr;
+		// native only: fail with the reason rather than download under Wine
+		// asynchronously, as a network failure: the caller stores the request after this returns
+		auto failed = std::make_shared<NativeRequest>(0, options, callback);
+		std::string error = !g_helper.active ? "native download helper unavailable" : "no Linux path for " + windowsPath;
+		std::thread([failed, error]
+		{
+			Sleep(50);
+			failed->OnDone(json{ { "ok", false }, { "error", error } }, {});
+		}).detach();
+		return failed;
 	}
 
 	uint64_t id = g_helper.nextId++;
@@ -338,9 +349,15 @@ HttpRequestPtr DoFileGetRequest(const std::string& url, const std::string& windo
 			{ "weight", options.weight }, { "max_size", options.maxFilesize }, { "error_body", options.addErrorBody },
 			{ "follow", options.followLocation } }))
 	{
-		std::unique_lock _(g_helper.lock);
-		g_helper.requests.erase(id);
-		return nullptr;
+		{
+			std::unique_lock _(g_helper.lock);
+			g_helper.requests.erase(id);
+		}
+		std::thread([request]
+		{
+			Sleep(50);
+			request->OnDone(json{ { "ok", false }, { "error", "native download helper connection lost" } }, {});
+		}).detach();
 	}
 
 	return request;

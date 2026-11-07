@@ -558,8 +558,8 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 				}
 			};
 
-			// natively on Linux when the launcher's helper is there (NativeDownloader.cpp), else
-			// HttpClient under Wine; same file in the cache's unconfirmed folder either way
+			// natively on Linux when launched by the native launcher (NativeDownloader.cpp, no
+			// fallback then), HttpClient otherwise; same file in the cache's unconfirmed folder
 			std::string physFileName = fmt::sprintf("%sunconfirmed/%s_%08x", m_cache->GetPhysCachePath(), "cache", HashString(entry.referenceHash.c_str()));
 			auto req = fx::native_downloads::DoFileGetRequest(entry.remoteUrl, physFileName, options, onDownloaded);
 			if (!req)
