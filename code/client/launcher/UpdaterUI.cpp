@@ -1386,8 +1386,80 @@ void UI_DestroyTen()
 	TenUIStorage::ReallyBreakIt();
 }
 
+// Native launcher bridge (linux-native): when CitizenFX_NativeUI names a file, a FIFO the Linux
+// launcher reads, the updater UI is drawn by the launcher instead of a Win32 window. One line per
+// update, UTF-8: "show", "hide", "text0 <text>", "text1 <text>", "progress <percent>",
+// "error <text>" (newlines as \n); the launcher asks for cancellation by creating "<file>.cancel".
+static HANDLE g_nativeUi = INVALID_HANDLE_VALUE;
+static std::wstring g_nativeUiCancel;
+
+static bool NativeUI_Active()
+{
+	static int state = -1;
+
+	if (state < 0)
+	{
+		wchar_t path[MAX_PATH];
+		state = 0;
+
+		if (GetEnvironmentVariableW(L"CitizenFX_NativeUI", path, std::size(path)))
+		{
+			g_nativeUi = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+
+			if (g_nativeUi != INVALID_HANDLE_VALUE)
+			{
+				g_nativeUiCancel = std::wstring(path) + L".cancel";
+				state = 1;
+			}
+		}
+	}
+
+	return state == 1;
+}
+
+static void NativeUI_Send(const char* verb, const wchar_t* text = nullptr)
+{
+	std::string line = verb;
+
+	if (text)
+	{
+		int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+		std::string utf8(size > 0 ? size - 1 : 0, '\0');
+
+		if (size > 1)
+		{
+			WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8.data(), size, nullptr, nullptr);
+		}
+
+		line += ' ';
+
+		for (char c : utf8)
+		{
+			if (c == '\n')
+			{
+				line += "\\n";
+			}
+			else if (c != '\r')
+			{
+				line += c;
+			}
+		}
+	}
+
+	line += '\n';
+
+	DWORD written;
+	WriteFile(g_nativeUi, line.data(), (DWORD)line.size(), &written, NULL);
+}
+
 void UI_DoCreation(bool safeMode)
 {
+	if (NativeUI_Active())
+	{
+		NativeUI_Send("show");
+		return;
+	}
+
 	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
 	if (g_tenUI && g_uui.tenMode)
@@ -1457,6 +1529,12 @@ void UI_DoCreation(bool safeMode)
 
 void UI_DoDestruction()
 {
+	if (NativeUI_Active())
+	{
+		NativeUI_Send("hide");
+		return;
+	}
+
 	static HostSharedData<CfxState> initState("CfxInitState");
 	AllowSetForegroundWindow((initState->gamePid) ? initState->gamePid : GetCurrentProcessId());
 
@@ -1469,6 +1547,19 @@ void UI_DoDestruction()
 
 void UI_UpdateText(int textControl, const wchar_t* text)
 {
+	if (NativeUI_Active())
+	{
+		std::wstring tstr = text;
+
+		if (textControl != 0)
+		{
+			std::transform(tstr.begin(), tstr.end(), tstr.begin(), ::towupper);
+		}
+
+		NativeUI_Send(textControl == 0 ? "text0" : "text1", tstr.c_str());
+		return;
+	}
+
 	if (g_uui.ten)
 	{
 		std::wstring tstr = text;
@@ -1500,6 +1591,12 @@ void UI_UpdateText(int textControl, const wchar_t* text)
 
 void UI_UpdateProgress(double percentage)
 {
+	if (NativeUI_Active())
+	{
+		NativeUI_Send(va("progress %.1f", percentage));
+		return;
+	}
+
 	if (g_uui.ten)
 	{
 		try
@@ -1531,11 +1628,22 @@ void UI_UpdateProgress(double percentage)
 
 bool UI_IsCanceled()
 {
+	if (NativeUI_Active())
+	{
+		return GetFileAttributesW(g_nativeUiCancel.c_str()) != INVALID_FILE_ATTRIBUTES;
+	}
+
 	return g_uui.canceled;
 }
 
 void UI_DisplayError(const wchar_t* error)
 {
+	if (NativeUI_Active())
+	{
+		NativeUI_Send("error", error);
+		return;
+	}
+
 	static TASKDIALOGCONFIG taskDialogConfig = { 0 };
 	taskDialogConfig.cbSize = sizeof(taskDialogConfig);
 	taskDialogConfig.hInstance = GetModuleHandle(nullptr);
