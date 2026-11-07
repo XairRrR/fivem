@@ -12,6 +12,7 @@
 #include <tbb/concurrent_unordered_map.h>
 
 #include <HttpClient.h>
+#include "NativeDownloader.h"
 
 #include <ResourceCache.h>
 #include <ResourceManager.h>
@@ -540,7 +541,7 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 
 			std::string referenceHash = entry.referenceHash;
 
-			auto req = Instance<HttpClient>::Get()->DoFileGetRequest(entry.remoteUrl, vfs::GetDevice(outFileName), outFileName, options, [this, referenceHash, tce, outFileName](bool result, const char* errorData, size_t outSize)
+			auto onDownloaded = [this, referenceHash, tce, outFileName](bool result, const char* errorData, size_t outSize)
 			{
 				RemoveHttpRequest(referenceHash);
 
@@ -555,7 +556,16 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 				{
 					tce.set({ false, std::string(errorData, outSize) });
 				}
-			});
+			};
+
+			// natively on Linux when the launcher's helper is there (NativeDownloader.cpp), else
+			// HttpClient under Wine; same file in the cache's unconfirmed folder either way
+			std::string physFileName = fmt::sprintf("%sunconfirmed/%s_%08x", m_cache->GetPhysCachePath(), "cache", HashString(entry.referenceHash.c_str()));
+			auto req = fx::native_downloads::DoFileGetRequest(entry.remoteUrl, physFileName, options, onDownloaded);
+			if (!req)
+			{
+				req = Instance<HttpClient>::Get()->DoFileGetRequest(entry.remoteUrl, vfs::GetDevice(outFileName), outFileName, options, onDownloaded);
+			}
 
 			StoreHttpRequest(referenceHash, req);
 
