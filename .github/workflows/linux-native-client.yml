@@ -71,6 +71,9 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item -Recurse -Force caches\fivereborn\* $stage
           Move-Item (Join-Path $stage 'CitizenFX.exe') (Join-Path $stage 'FiveM.exe')
+          # citizen/release.txt is the number the menu shows ("Ver. N", cfx::GetPlatformRelease):
+          # Cfx.re's pipeline writes its BuildID (CI_PIPELINE_ID), empty here; this build's number
+          Set-Content -NoNewline -Encoding ascii (Join-Path $stage 'citizen\release.txt') $env:GITHUB_RUN_NUMBER
           # FiveM's own developer mode: skip the official auto-updater, which would
           # replace this build with the official one (launcher/Main.cpp).
           New-Item -ItemType File (Join-Path $stage 'FiveM.exe.formaldev') | Out-Null
