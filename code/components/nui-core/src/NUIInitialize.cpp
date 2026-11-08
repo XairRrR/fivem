@@ -1250,9 +1250,15 @@ static HRESULT D3D11CreateDeviceHookMain(_In_opt_ IDXGIAdapter* pAdapter, D3D_DR
 
 #include <include/cef_version_info.h>
 
+static std::once_flag g_d3d11HooksOnce;
+
+// the Direct3D 11 hooks (adapter, BGRA support: every device of the process, the game's too), once;
+// the GL hooks of ANGLE (CFX_BIND_GAME_VIEW) when ANGLE is loaded (libGL)
 void HookLibGL(HMODULE libGL)
 {
 #if !GTA_NY
+	std::call_once(g_d3d11HooksOnce, []()
+	{
 	wchar_t systemDir[MAX_PATH];
 	GetSystemDirectoryW(systemDir, std::size(systemDir));
 
@@ -1289,9 +1295,6 @@ void HookLibGL(HMODULE libGL)
 	g_usingReshade = true;
 
 	MH_Initialize();
-	MH_CreateHook(GetProcAddress(libGL, "glTexParameterf"), glTexParameterfHook, (void**)&g_origglTexParameterf);
-	MH_CreateHook(GetProcAddress(libGL, "glBindTexture"), glBindTextureHook, (void**)&g_origglBindTexture);
-	MH_CreateHook(GetProcAddress(libGL, "glDeleteTextures"), glDeleteTexturesHook, (void**)&g_origglDeleteTextures);
 	if (sysDll != realSysDll)
 	{
 		trace("You're using a broken 'graphics mod' that tries to hide D3D11.dll from us. Why?\n");
@@ -1310,12 +1313,93 @@ void HookLibGL(HMODULE libGL)
 	{
 		MH_CreateHook(GetProcAddress(mainDll, "D3D11CreateDevice"), D3D11CreateDeviceHookMain, (void**)&g_origD3D11CreateDeviceMain);
 	}
+	});
+
+	if (libGL)
+	{
+		MH_CreateHook(GetProcAddress(libGL, "glTexParameterf"), glTexParameterfHook, (void**)&g_origglTexParameterf);
+		MH_CreateHook(GetProcAddress(libGL, "glBindTexture"), glBindTextureHook, (void**)&g_origglBindTexture);
+		MH_CreateHook(GetProcAddress(libGL, "glDeleteTextures"), glDeleteTexturesHook, (void**)&g_origglDeleteTextures);
+	}
 
 	MH_EnableHook(MH_ALL_HOOKS);
 #endif
 }
 
 extern bool g_inited;
+
+static bool g_cefLibrariesDeferred;
+static std::once_flag g_cefLibrariesOnce;
+
+// the libraries of the Windows CEF, once: at pre-init (upstream), or when the runtime starts
+static void LoadCefLibraries()
+{
+	std::call_once(g_cefLibrariesOnce, []()
+	{
+		// CEF keeps loading/unloading this - load it ourselves to make the refcount always 1
+		LoadLibrary(L"bluetoothapis.dll");
+
+		// load Chrome dependencies ourselves so that the system won't try loading from other paths
+		LoadLibrary(MakeRelativeCitPath(L"bin/chrome_elf.dll").c_str());
+
+		// we don't need to load ANGLE if this is utility or renderer
+		if (wcsstr(GetCommandLineW(), L"type=utility") == nullptr && wcsstr(GetCommandLineW(), L"type=renderer") == nullptr)
+		{
+			LoadLibrary(MakeRelativeCitPath(L"bin/libEGL.dll").c_str());
+			HMODULE libGL = LoadLibrary(MakeRelativeCitPath(L"bin/libGLESv2.dll").c_str());
+
+			// hook libGLESv2 for Cfx purposes
+			HookLibGL(libGL);
+		}
+
+		// load the CEF library
+		HMODULE libcef = LoadLibraryW(MakeRelativeCitPath(L"bin/libcef.dll").c_str());
+		g_libgl = std::unique_ptr<ModuleData>(new ModuleData{ L"libGLESv2.dll", L"libEGL.dll", L"libcef.dll" });
+
+		if (!libcef)
+		{
+			auto gle = GetLastError();
+
+			_wunlink(MakeRelativeCitPath(L"content_index.xml").c_str());
+			FatalError("Could not load bin/libcef.dll.\nLoadLibraryW failed for reason %d.", gle);
+		}
+
+		__HrLoadAllImportsForDll("libcef.dll");
+
+		// verify if the CEF API hash is screwed
+		{
+			const char* apiHash = cef_api_hash(CEF_API_VERSION, 0);
+			const char* apiHashUniversal = cef_api_hash(CEF_API_VERSION, 1);
+	 		if (strcmp(apiHash, CEF_API_HASH_PLATFORM) != 0)
+			{
+				_wunlink(MakeRelativeCitPath(L"content_index.xml").c_str());
+				FatalError("CEF API hash mismatch\nA mismatch was detected between `nui-core.dll` and `bin/libcef.dll`. Please restart the game and try again.\n\nPlatform hash:\n%s\n%s\n\nUniversal hash:\n%s",
+				apiHash,
+				CEF_API_HASH_PLATFORM,
+				apiHashUniversal);
+			}
+		}
+	});
+}
+
+// linux-native: the game process (not one of CEF's subprocesses, which keep upstream's path), with
+// the native NUI host (CitizenFX_NativeNUIFrames) rendering the main menu too (CitizenFX_NativeNUIMenu)
+static bool DeferCefLibraries()
+{
+	if (wcsstr(GetCommandLineW(), L"type="))
+	{
+		return false;
+	}
+
+	wchar_t value[MAX_PATH];
+
+	if (!GetEnvironmentVariableW(L"CitizenFX_NativeNUIFrames", value, std::size(value)))
+	{
+		return false;
+	}
+
+	return GetEnvironmentVariableW(L"CitizenFX_NativeNUIMenu", value, std::size(value)) && value[0] == L'1';
+}
 
 void Component_RunPreInit()
 {
@@ -1325,48 +1409,19 @@ void Component_RunPreInit()
 		return;
 	}
 
-	// CEF keeps loading/unloading this - load it ourselves to make the refcount always 1
-	LoadLibrary(L"bluetoothapis.dll");
+	// the native Linux host renders the NUI and the main menu (linux-native): the Windows CEF's
+	// libraries (chrome_elf, ANGLE, libcef.dll: 300 MB) only if a browser ever needs them
+	// (StartCefRuntime); the game's Direct3D 11 devices still go through the hooks
+	g_cefLibrariesDeferred = DeferCefLibraries();
 
-	// load Chrome dependencies ourselves so that the system won't try loading from other paths
-	LoadLibrary(MakeRelativeCitPath(L"bin/chrome_elf.dll").c_str());
-
-	// we don't need to load ANGLE if this is utility or renderer
-	if (wcsstr(GetCommandLineW(), L"type=utility") == nullptr && wcsstr(GetCommandLineW(), L"type=renderer") == nullptr)
+	if (g_cefLibrariesDeferred)
 	{
-		LoadLibrary(MakeRelativeCitPath(L"bin/libEGL.dll").c_str());
-		HMODULE libGL = LoadLibrary(MakeRelativeCitPath(L"bin/libGLESv2.dll").c_str());
-
-		// hook libGLESv2 for Cfx purposes
-		HookLibGL(libGL);
+		HookLibGL(nullptr);
+		g_libgl = std::unique_ptr<ModuleData>(new ModuleData{ L"libGLESv2.dll", L"libEGL.dll", L"libcef.dll" });
 	}
-
-	// load the CEF library
-	HMODULE libcef = LoadLibraryW(MakeRelativeCitPath(L"bin/libcef.dll").c_str());
-	g_libgl = std::unique_ptr<ModuleData>(new ModuleData{ L"libGLESv2.dll", L"libEGL.dll", L"libcef.dll" });
-
-	if (!libcef)
+	else
 	{
-		auto gle = GetLastError();
-
-		_wunlink(MakeRelativeCitPath(L"content_index.xml").c_str());
-		FatalError("Could not load bin/libcef.dll.\nLoadLibraryW failed for reason %d.", gle);
-	}
-
-	__HrLoadAllImportsForDll("libcef.dll");
-
-	// verify if the CEF API hash is screwed
-	{
-		const char* apiHash = cef_api_hash(CEF_API_VERSION, 0);
-		const char* apiHashUniversal = cef_api_hash(CEF_API_VERSION, 1);
- 		if (strcmp(apiHash, CEF_API_HASH_PLATFORM) != 0)
-		{
-			_wunlink(MakeRelativeCitPath(L"content_index.xml").c_str());
-			FatalError("CEF API hash mismatch\nA mismatch was detected between `nui-core.dll` and `bin/libcef.dll`. Please restart the game and try again.\n\nPlatform hash:\n%s\n%s\n\nUniversal hash:\n%s",
-			apiHash,
-			CEF_API_HASH_PLATFORM,
-			apiHashUniversal);
-		}
+		LoadCefLibraries();
 	}
 
 	Instance<NUIApp>::Set(new NUIApp());
@@ -1383,6 +1438,11 @@ void Component_RunPreInit()
 
     InitFunctionBase::RunAll();
 	g_inited = true;
+
+	if (g_cefLibrariesDeferred)
+	{
+		return;
+	}
 
 	// try to execute as a CEF process
 	int exitCode = CefExecuteProcess(args, app, nullptr);
@@ -1476,6 +1536,8 @@ void AddCrossOriginWhitelistEntry(const std::string& sourceOrigin, const std::st
 
 static void StartCefRuntime()
 {
+	LoadCefLibraries();
+
 	std::wstring cachePath = GetNUIStoragePath();
 	auto selfApp = Instance<NUIApp>::Get();
 
