@@ -40,6 +40,17 @@
 #include <queue>
 #include <sstream>
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <deque>
+#include <mutex>
+#include <thread>
+
+#include <json.hpp>
+
+#pragma comment(lib, "ws2_32.lib")
+
 static bool fallbackPoll = true;
 
 static std::string_view GetBaseName(std::string_view str)
@@ -129,7 +140,252 @@ struct download_t : baseDownload
 	int numRetries = 10;
 
 	char curlError[CURL_ERROR_SIZE * 4];
+
+	// linux-native: a transfer of the native helper (0: none), its bytes so far; failed: use curl
+	uint64_t nativeId = 0;
+	int64_t nativeBytes = 0;
+	bool nativeFailed = false;
 };
+
+/*
+ * linux-native: downloads through the native Linux helper (wine-fivem fivem-helper, protocol in its
+ * src/helper.cc) when the native launcher started FiveM under Wine (CitizenFX_NativeHelper): the
+ * system's libcurl downloads outside Wine and writes the file itself, decompressed (xz, zstd) as
+ * DL_WriteToFile would; here only progress and the result arrive, and the file is moved as after
+ * a curl transfer. A fresh download only (no resume, not to memory); on any failure, curl as before.
+ */
+namespace native_dl
+{
+using json = nlohmann::json;
+
+struct Event
+{
+	uint64_t id;
+	bool done;
+	bool ok;
+	int64_t bytes;
+	std::string error;
+};
+
+static std::once_flag g_init;
+static bool g_active;
+static SOCKET g_sock = INVALID_SOCKET;
+static std::mutex g_sendLock;
+static std::mutex g_eventLock;
+static std::deque<Event> g_events;
+static uint64_t g_nextId = 1;
+
+static bool SendAll(const char* data, size_t size)
+{
+	while (size)
+	{
+		int n = send(g_sock, data, int(std::min<size_t>(size, 1 << 20)), 0);
+		if (n <= 0)
+		{
+			return false;
+		}
+		data += n;
+		size -= n;
+	}
+	return true;
+}
+
+static bool RecvAll(char* data, size_t size)
+{
+	while (size)
+	{
+		int n = recv(g_sock, data, int(std::min<size_t>(size, 1 << 20)), 0);
+		if (n <= 0)
+		{
+			return false;
+		}
+		data += n;
+		size -= n;
+	}
+	return true;
+}
+
+static bool Send(const json& message)
+{
+	std::string text = message.dump(-1, ' ', false, json::error_handler_t::replace);
+	uint32_t sizes[2] = { uint32_t(text.size()), 0 };
+
+	std::unique_lock _(g_sendLock);
+	if (!g_active || !SendAll((const char*)sizes, sizeof(sizes)) || !SendAll(text.data(), text.size()))
+	{
+		g_active = false;
+		return false;
+	}
+	return true;
+}
+
+static void Reader()
+{
+	for (;;)
+	{
+		uint32_t sizes[2];
+		if (!RecvAll((char*)sizes, sizeof(sizes)))
+		{
+			break;
+		}
+		std::string text(sizes[0], '\0'), body(sizes[1], '\0');
+		if (!RecvAll(text.data(), text.size()) || !RecvAll(body.data(), body.size()))
+		{
+			break;
+		}
+
+		json m = json::parse(text, nullptr, false);
+		if (m.is_discarded() || !m.is_object())
+		{
+			continue;
+		}
+
+		std::string type = m.value("t", "");
+		Event e{ m.value("id", uint64_t(0)), type == "done", m.value("ok", false), 0, m.value("error", "") };
+		if (type == "progress")
+		{
+			e.bytes = m.value("now", int64_t(0));
+		}
+		else if (type == "done")
+		{
+			e.bytes = m.value("size", int64_t(0));
+		}
+		else
+		{
+			continue;
+		}
+
+		std::unique_lock _(g_eventLock);
+		g_events.push_back(std::move(e));
+	}
+
+	// every transfer in flight fails: their downloads go back to curl
+	g_active = false;
+	std::unique_lock _(g_eventLock);
+	g_events.push_back(Event{ 0, true, false, 0, "helper disconnected" });
+}
+
+static bool Connect()
+{
+	std::call_once(g_init, []()
+	{
+		char value[64];
+		DWORD length = GetEnvironmentVariableA("CitizenFX_NativeHelper", value, sizeof(value));
+		if (!length || length >= sizeof(value))
+		{
+			return;
+		}
+
+		std::string address = value;
+		auto colon = address.rfind(':');
+		if (colon == std::string::npos)
+		{
+			return;
+		}
+
+		WSADATA wsa;
+		WSAStartup(MAKEWORD(2, 2), &wsa);
+		SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		sockaddr_in addr = {};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(uint16_t(atoi(address.c_str() + colon + 1)));
+		inet_pton(AF_INET, address.substr(0, colon).c_str(), &addr.sin_addr);
+		if (s == INVALID_SOCKET || connect(s, (sockaddr*)&addr, sizeof(addr)) != 0)
+		{
+			if (s != INVALID_SOCKET)
+			{
+				closesocket(s);
+			}
+			return;
+		}
+
+		g_sock = s;
+		g_active = true;
+
+		char token[128];
+		length = GetEnvironmentVariableA("CitizenFX_NativeHelperToken", token, sizeof(token));
+		if (length && length < sizeof(token))
+		{
+			Send(json{ { "t", "auth" }, { "token", std::string(token, length) } });
+		}
+
+		std::thread(Reader).detach();
+	});
+
+	return g_active;
+}
+
+// the Linux path of a Windows path, by Wine (kernel32's wine_get_unix_file_name)
+static std::string UnixPath(const std::string& windowsPath)
+{
+	using Fn = char*(CDECL*)(const wchar_t*);
+	static auto fn = (Fn)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "wine_get_unix_file_name");
+	if (!fn)
+	{
+		return {};
+	}
+
+	std::wstring wide = ToWide(windowsPath);
+	for (auto& c : wide)
+	{
+		if (c == L'/')
+		{
+			c = L'\\';
+		}
+	}
+
+	char* unixPath = fn(wide.c_str());
+	if (!unixPath)
+	{
+		return {};
+	}
+	std::string result = unixPath;
+	HeapFree(GetProcessHeap(), 0, unixPath);
+	return result;
+}
+
+static uint64_t Start(download_t* download)
+{
+	std::string path = UnixPath(download->tmpPath);
+	if (path.empty())
+	{
+		return 0;
+	}
+
+	uint64_t id = g_nextId++;
+	json request = {
+		{ "t", "get" }, { "id", id }, { "url", download->url }, { "path", path },
+		{ "headers", { { "X-Cfx-Client", "1" } } }
+	};
+	if (download->algorithm == compressionAlgo_e::XZ)
+	{
+		request["decompress"] = "xz";
+	}
+	else if (download->algorithm == compressionAlgo_e::Zstd)
+	{
+		request["decompress"] = "zstd";
+	}
+
+	return Send(request) ? id : 0;
+}
+
+static void Cancel(uint64_t id)
+{
+	Send(json{ { "t", "cancel" }, { "id", id } });
+}
+
+static bool Poll(Event& out)
+{
+	std::unique_lock _(g_eventLock);
+	if (g_events.empty())
+	{
+		return false;
+	}
+	out = std::move(g_events.front());
+	g_events.pop_front();
+	return true;
+}
+}
 
 struct dlState
 {
@@ -224,6 +480,12 @@ void DL_Shutdown()
 {
 	for (const auto& download : dls.currentDownloads)
 	{
+		if (download->nativeId)
+		{
+			native_dl::Cancel(download->nativeId);
+			download->nativeId = 0;
+		}
+
 		if (download->fp[0])
 		{
 			fclose(download->fp[0]);
@@ -649,12 +911,88 @@ bool DL_ProcessDownload()
 		return true;
 	};
 
-	// create new handles if we don't have one yet
+	// create new handles if we don't have one yet: the native helper's (linux-native), else curl's
 	for (auto& download : dls.currentDownloads)
 	{
-		if (!download->curlHandles[0])
+		if (!download->curlHandles[0] && !download->nativeId)
 		{
+			if (!download->nativeFailed && download->progress == 0 && native_dl::Connect() && initDownload(download.get()))
+			{
+				if (download->fp[0])
+				{
+					fclose(download->fp[0]);
+					download->fp[0] = nullptr;
+				}
+
+				if (!download->writeToMemory)
+				{
+					download->nativeId = native_dl::Start(download.get());
+				}
+
+				if (download->nativeId)
+				{
+					download->nativeBytes = 0;
+					continue;
+				}
+
+				download->nativeFailed = true;
+			}
+
 			initCurlDownload(download.get());
+		}
+	}
+
+	// the native helper's progress and results
+	for (native_dl::Event ev; native_dl::Poll(ev);)
+	{
+		for (auto it = dls.currentDownloads.begin(); it != dls.currentDownloads.end(); it++)
+		{
+			auto download = *it;
+
+			if (!download->nativeId || (ev.id && ev.id != download->nativeId))
+			{
+				continue;
+			}
+
+			if (!ev.done || ev.ok)
+			{
+				// as DL_WriteToFile counts curl's bytes
+				int64_t delta = ev.bytes - download->nativeBytes;
+				if (delta > 0)
+				{
+					download->nativeBytes = ev.bytes;
+					download->progress += delta;
+					dls.completedSize += delta;
+					DL_UpdateGlobalProgress(size_t(delta));
+				}
+			}
+
+			if (ev.done && ev.ok)
+			{
+				download->nativeId = 0;
+
+				if (!onSuccess(it))
+				{
+					return false;
+				}
+			}
+			else if (ev.done)
+			{
+				// curl from the start, as if the helper had not been there
+				trace("Native download of %s failed (%s), retrying with curl\n", download->url, ev.error);
+
+				dls.completedSize -= download->progress;
+				dls.doneTotalBytes -= download->progress;
+				download->progress = 0;
+				download->nativeId = 0;
+				download->nativeFailed = true;
+			}
+
+			// one transfer per event, unless the helper went away (id 0: all of them)
+			if (ev.id)
+			{
+				break;
+			}
 		}
 	}
 
