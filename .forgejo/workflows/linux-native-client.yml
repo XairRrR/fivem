@@ -1,0 +1,137 @@
+# Builds the FiveM client from this branch on git.hexid.me's Windows runner (label windows-2022,
+# fivem-linux tools/windows-runner/setup-runner.ps1) with Cfx.re's own pipeline
+# (code/tools/ci/build_client.ps1) in dry-run mode: nothing is uploaded to Cfx.re, the private/closed
+# components are not available and are skipped.
+#
+# The tree is built in a fixed folder of the runner (D:\fivem-build), not in the job's workspace:
+# MSBuild and the CEF/prebuild steps then only redo what changed (a component build in minutes
+# instead of a whole client). The result goes to the private package registry of git.hexid.me:
+#   nta/generic/fivem-client/<run>-<sha7>/fivem-client-linux-native.zip     (whole client)
+#   nta/generic/fivem-client-components/<run>-<sha7>/<project>.dll          (inputs.projects)
+# fivem-update (fivem-linux) installs them.
+name: Build FiveM client (linux-native)
+
+on:
+  workflow_dispatch:
+    inputs:
+      projects:
+        description: "Component build: only these projects (e.g. nui-core,citizen-resources-client) and their dependencies. Empty: the whole client."
+        required: false
+        default: ""
+      clean:
+        description: "Start from an empty build folder"
+        required: false
+        default: "false"
+
+jobs:
+  client:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      BUILD_DIR: D:\fivem-build
+      CI: "true"
+      CFX_PRODUCT_NAME: fivem
+      CFX_DRY_RUN: "true"
+      CFX_RETAIL_BUILD: "false"
+      CFX_MSBUILD_PROJECTS: ${{ inputs.projects }}
+      PACKAGES: ${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic
+
+    steps:
+      - name: Source in the build folder
+        shell: pwsh
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path (Split-Path $env:BUILD_DIR -Qualifier))) { $env:BUILD_DIR = 'C:\fivem-build' }
+          if ('${{ inputs.clean }}' -eq 'true' -and (Test-Path $env:BUILD_DIR)) { Remove-Item -Recurse -Force $env:BUILD_DIR }
+          # the job's token, only for this command (never written into the repository's config)
+          $auth = 'http.extraHeader=Authorization: Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${env:TOKEN}:"))
+          $url = "${{ github.server_url }}/${{ github.repository }}.git"
+          if (-not (Test-Path (Join-Path $env:BUILD_DIR '.git'))) {
+            git init -q $env:BUILD_DIR
+            git -C $env:BUILD_DIR remote add origin $url
+          }
+          git -C $env:BUILD_DIR -c $auth fetch -q --depth 50 origin '${{ github.sha }}'
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+          git -C $env:BUILD_DIR checkout -q -f '${{ github.sha }}'
+          # the submodules are public (GitHub)
+          git -C $env:BUILD_DIR submodule sync -q --recursive
+          git -C $env:BUILD_DIR submodule update -q --init --recursive --depth 1 --jobs 8
+          if ($LASTEXITCODE -ne 0) { throw "git submodule update failed" }
+          "BUILD_DIR=$env:BUILD_DIR" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SHA7=$('${{ github.sha }}'.Substring(0, 7))" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          python --version; py --version; node --version; yarn --version
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.22000.0\um")) {
+            throw "Windows SDK 10.0.22000 missing on this runner (setup-runner.ps1)"
+          }
+
+      - name: Build and pack client (Cfx.re pipeline, dry run)
+        shell: pwsh
+        run: |
+          $env:CI_PROJECT_DIR = $env:BUILD_DIR
+          $env:CI_COMMIT_REF_NAME = '${{ github.ref_name }}'
+          $env:CI_COMMIT_SHA = '${{ github.sha }}'
+          $env:npm_config_python = (Get-Command python).Source
+          Set-Location $env:BUILD_DIR
+          .\code\tools\ci\build_client.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish components
+        if: ${{ inputs.projects != '' }}
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ github.run_number }}-$env:SHA7"
+          $bin = Join-Path $env:BUILD_DIR '.build-cache\bin\five\release'
+          $stage = Join-Path $env:RUNNER_TEMP 'components'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          foreach ($p in ('${{ inputs.projects }}' -split '[,; ]+' | Where-Object { $_ })) {
+            Copy-Item (Join-Path $bin "$p.dll") $stage
+          }
+          Set-Content -NoNewline -Encoding ascii (Join-Path $stage 'linux-native-commit.txt') '${{ github.sha }}'
+          foreach ($f in Get-ChildItem $stage) {
+            Invoke-RestMethod -Method Put -InFile $f.FullName -Headers @{ Authorization = "token $env:TOKEN" } `
+              -Uri "$env:PACKAGES/fivem-client-components/$version/$($f.Name)"
+            Write-Host "published $($f.Name) ($version)"
+          }
+
+      - name: Package for Wine/Proton and publish
+        if: ${{ inputs.projects == '' }}
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ github.run_number }}-$env:SHA7"
+          $stage = Join-Path $env:RUNNER_TEMP 'FiveM'
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $env:BUILD_DIR 'caches\fivereborn\*') $stage
+          Move-Item (Join-Path $stage 'CitizenFX.exe') (Join-Path $stage 'FiveM.exe')
+          # citizen/release.txt is the number the menu shows ("Ver. N", cfx::GetPlatformRelease)
+          Set-Content -NoNewline -Encoding ascii (Join-Path $stage 'citizen\release.txt') '${{ github.run_number }}'
+          # FiveM's own developer mode: the official auto-updater would replace this build
+          New-Item -ItemType File (Join-Path $stage 'FiveM.exe.formaldev') | Out-Null
+          '${{ github.sha }}' | Out-File -Encoding ascii (Join-Path $stage 'linux-native-commit.txt')
+          $zip = Join-Path $env:RUNNER_TEMP 'fivem-client-linux-native.zip'
+          if (Test-Path $zip) { Remove-Item $zip }
+          7z a -tzip $zip $stage | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+          Invoke-RestMethod -Method Put -InFile $zip -Headers @{ Authorization = "token $env:TOKEN" } `
+            -Uri "$env:PACKAGES/fivem-client/$version/fivem-client-linux-native.zip"
+          Write-Host "published fivem-client $version"
+
+      - name: Build logs on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Filter *.log (Join-Path $env:BUILD_DIR '.build-cache\build'), (Join-Path $env:BUILD_DIR 'code\build') -ErrorAction Ignore |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 3 | ForEach-Object {
+              Write-Host "==== $($_.FullName)"; Get-Content -Tail 80 $_.FullName }
