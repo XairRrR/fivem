@@ -615,9 +615,15 @@ int RealMain()
 #endif
 
 	loadSystemDll(L"\\d3d9.dll");
-	loadSystemDll(L"\\d3d10.dll");
-	loadSystemDll(L"\\d3d10_1.dll");
-	loadSystemDll(L"\\opengl32.dll");
+
+	// linux-native: under the native Linux launcher (CitizenFX_LinuxNative) the prefix holds no proxy
+	// DLLs to beat, and under Wine these drag in wined3d and the host's OpenGL driver for nothing
+	if (!GetEnvironmentVariableW(L"CitizenFX_LinuxNative", nullptr, 0))
+	{
+		loadSystemDll(L"\\d3d10.dll");
+		loadSystemDll(L"\\d3d10_1.dll");
+		loadSystemDll(L"\\opengl32.dll");
+	}
 
 #ifndef LAUNCHER_PERSONALITY_CHROME
 	LoadLibrary(MakeRelativeCitPath(L"botan.dll").c_str());
